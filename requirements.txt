@@ -1,0 +1,6 @@
+openai-whisper
+torch
+numpy
+scipy
+ffmpeg-python
+webrtcvad
