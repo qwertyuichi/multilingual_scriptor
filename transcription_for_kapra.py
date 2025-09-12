@@ -3,6 +3,7 @@ import argparse
 import os
 import tempfile
 import subprocess
+import json
 import numpy as np
 from pathlib import Path
 import torch
@@ -10,6 +11,105 @@ import warnings
 from scipy.io import wavfile
 import webrtcvad
 warnings.filterwarnings("ignore")
+
+def build_hybrid_segments(model, audio_path: str, min_seg_dur: float = 0.25):
+    """ja / ru の2回 transcription を行い、両者の start/end 境界を統合して細分化区間を返す。
+    return: [{'start': float, 'end': float}] 最低長 min_seg_dur でフィルタ。
+    Whisper の内部 token 化境界の union を利用し、片言や混在発話の取りこぼし減少を狙う。
+    """
+    print("[HYBRID] ja固定・ru固定の2パスで境界抽出中...")
+    ja_res = model.transcribe(
+        audio_path,
+        language='ja',
+        verbose=False,
+        condition_on_previous_text=False,
+        word_timestamps=False,
+        task='transcribe'
+    )
+    ru_res = model.transcribe(
+        audio_path,
+        language='ru',
+        verbose=False,
+        condition_on_previous_text=False,
+        word_timestamps=False,
+        task='transcribe'
+    )
+    points = set()
+    for seg in ja_res.get('segments', []):
+        points.add(round(float(seg['start']), 2))
+        points.add(round(float(seg['end']), 2))
+    for seg in ru_res.get('segments', []):
+        points.add(round(float(seg['start']), 2))
+        points.add(round(float(seg['end']), 2))
+    pts = sorted(p for p in points if p >= 0)
+    merged = []
+    for i in range(len(pts) - 1):
+        st = pts[i]; ed = pts[i+1]
+        if ed - st >= min_seg_dur:
+            merged.append({'start': st, 'end': ed})
+    if not merged:  # フォールバック: ja_res をそのまま使う
+        return [{'start': s['start'], 'end': s['end']} for s in ja_res.get('segments', [])]
+    print(f"[HYBRID] 統合境界数: {len(merged)}")
+    return merged
+
+def refine_low_conf_segments(model, audio, segs, lowconf_logprob=-1.05, sample_rate=16000, debug=False):
+    """平均 logprob が低い / 長尺でやや低い セグメントを word_timestamps=True で細分化。
+    segs: [{'start','end','text','avg_logprob'?}] のリスト
+    戻り値: 置換後セグメントリスト（start/end/text を保持）
+    """
+    refined = []
+    for seg in segs:
+        st = seg['start']; ed = seg['end']
+        dur = ed - st
+        avg_lp = seg.get('avg_logprob', 0.0)
+        need_refine = (avg_lp < lowconf_logprob and dur > 0.8) or (dur > 4.0 and avg_lp < -0.6)
+        if not need_refine:
+            refined.append(seg)
+            continue
+        if debug:
+            print(f"[REFINE] {st:.2f}-{ed:.2f}s avg_logprob={avg_lp:.2f} dur={dur:.2f} -> word再分割")
+        start_smp = int(st * sample_rate); end_smp = int(ed * sample_rate)
+        clip = audio[start_smp:end_smp]
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpf:
+            tmp_path = tmpf.name
+        try:
+            wavfile.write(tmp_path, sample_rate, (clip * 32767).astype(np.int16))
+            sub_res = model.transcribe(
+                tmp_path,
+                language=None,
+                verbose=False,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                task='transcribe'
+            )
+            words = []
+            for s2 in sub_res.get('segments', []):
+                for w in s2.get('words', []) or []:
+                    # word dict: start, end, word
+                    if 'start' in w and 'end' in w:
+                        words.append(w)
+            if len(words) < 2:
+                refined.append(seg)
+            else:
+                # gap >0.6s でチャンク区切り
+                cur = [words[0]]
+                for w in words[1:]:
+                    if w['start'] - cur[-1]['end'] > 0.6:
+                        txt = ''.join(x['word'] for x in cur).strip()
+                        if txt:
+                            refined.append({'start': cur[0]['start'], 'end': cur[-1]['end'], 'text': txt})
+                        cur = [w]
+                    else:
+                        cur.append(w)
+                if cur:
+                    txt = ''.join(x['word'] for x in cur).strip()
+                    if txt:
+                        refined.append({'start': cur[0]['start'], 'end': cur[-1]['end'], 'text': txt})
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    refined.sort(key=lambda x: x['start'])
+    return refined
 
 def extract_audio_from_video(video_path, output_audio_path):
     """動画から音声を抽出"""
@@ -181,13 +281,24 @@ def format_time(seconds):
 
 def process_video(video_path, model_size='large', ja_weight=1.0, ru_weight=1.0, ambiguous_diff_threshold=10.0,
                   vad_level: int = 2, include_silent: bool = False, debug_segments: bool = False,
-                  gap_threshold: float = 0.35):
+                  gap_threshold: float = 0.35, seg_mode: str = 'auto', min_seg_dur: float = 0.25,
+                  lowconf_logprob: float | None = None, mix_threshold: float = 5.0,
+                  output_format: str = 'txt', segmentation_model_size: str | None = None,
+                  srt_max_line: int = 42):
     """動画を処理してテキストを生成"""
     print(f"動画を処理中: {video_path}")
     
     # Whisperモデルをロード
-    print(f"Whisperモデル ({model_size}) をロード中...")
-    model = whisper.load_model(model_size)
+    # 二段モデル: segmentation_model_size を指定すればそのモデルで境界、最終は model_size
+    if segmentation_model_size:
+        print(f"[LOAD] segmentation model ({segmentation_model_size}) をロード中...")
+        seg_model = whisper.load_model(segmentation_model_size)
+        print(f"[LOAD] final model ({model_size}) をロード中...")
+        model = whisper.load_model(model_size)
+    else:
+        print(f"Whisperモデル ({model_size}) をロード中...")
+        model = whisper.load_model(model_size)
+        seg_model = model  # 同一
     
     # 一時ファイルで音声を抽出
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_audio:
@@ -201,16 +312,33 @@ def process_video(video_path, model_size='large', ja_weight=1.0, ru_weight=1.0, 
         # 音声全体を読み込み
         audio = whisper.load_audio(audio_path)
         
-        # 最初に全体をセグメントに分割（言語検出なし）
+        # セグメント生成
         print("音声をセグメントに分割中...")
-        initial_result = model.transcribe(
-            audio_path,
-            language=None,  # 自動検出
-            verbose=False,
-            word_timestamps=False,
-            condition_on_previous_text=False,
-            task='transcribe'
-        )
+        if seg_mode == 'hybrid':
+            hybrid_segments = build_hybrid_segments(seg_model, audio_path, min_seg_dur=min_seg_dur)
+            # 既存処理互換のため initial_result 形式へラップ
+            initial_result = {'segments': []}
+            for seg in hybrid_segments:
+                initial_result['segments'].append({
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': '',
+                    'avg_logprob': 0.0
+                })
+        else:
+            initial_result = seg_model.transcribe(
+                audio_path,
+                language=None,  # 自動検出
+                verbose=False,
+                word_timestamps=False,
+                condition_on_previous_text=False,
+                task='transcribe'
+            )
+        # 低信頼再分割
+        if lowconf_logprob is not None and seg_mode != 'hybrid':
+            initial_result['segments'] = refine_low_conf_segments(
+                seg_model, audio, initial_result['segments'], lowconf_logprob=lowconf_logprob, debug=debug_segments
+            )
         
         # 各セグメントを個別に処理
         output_lines = []
@@ -254,6 +382,9 @@ def process_video(video_path, model_size='large', ja_weight=1.0, ru_weight=1.0, 
             return out
 
         prev_end = 0.0
+        srt_entries = []  # (index,start,end,text)
+        jsonl_entries = []
+        seg_index = 1
         for i, segment in enumerate(initial_result['segments']):
             start_time = segment['start']
             end_time = segment['end']
@@ -337,8 +468,25 @@ def process_video(video_path, model_size='large', ja_weight=1.0, ru_weight=1.0, 
                     ru_percent = int(round(ru_prob))
                     amb_tag = ' AMB' if amb_flag else ''
                     weight_tag = ' [W]' if weighted_mode else ''
-                    line = f"[{format_time(start_time)} -> {format_time(end_time)}]{amb_tag}{weight_tag} [JA:{ja_percent:03d}%] [RU:{ru_percent:03d}%] {text}"
+                    mix_tag = ''
+                    if abs(ja_prob - ru_prob) < mix_threshold:
+                        mix_tag = ' [MIX]'
+                    line = f"[{format_time(start_time)} -> {format_time(end_time)}]{amb_tag}{weight_tag}{mix_tag} [JA:{ja_percent:03d}%] [RU:{ru_percent:03d}%] {text}"
                     output_lines.append(line)
+                    # SRT/JSONL 用に保存
+                    srt_entries.append((seg_index, start_time, end_time, text))
+                    jsonl_entries.append({
+                        'index': seg_index,
+                        'start': start_time,
+                        'end': end_time,
+                        'text': text,
+                        'ja_prob': ja_prob,
+                        'ru_prob': ru_prob,
+                        'ambiguous': amb_flag,
+                        'mix': bool(mix_tag),
+                        'language': 'ja' if ja_prob >= ru_prob else 'ru'
+                    })
+                    seg_index += 1
                     if debug_segments:
                         print(f"  [DEBUG] 出力: {line}")
                 else:
@@ -355,7 +503,32 @@ def process_video(video_path, model_size='large', ja_weight=1.0, ru_weight=1.0, 
                     line = f"[{format_time(start_time)} -> {format_time(end_time)}] [JA:---%] [RU:---%] {text}"
                     output_lines.append(line)
         
-        return '\n'.join(output_lines)
+        # フォーマット出力構築
+        if output_format == 'txt':
+            return '\n'.join(output_lines)
+        elif output_format == 'srt':
+            def to_srt_timestamp(sec: float):
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                s = int(sec % 60)
+                ms = int((sec - int(sec)) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            blocks = []
+            for idx, st, ed, txt in srt_entries:
+                # 長過ぎる行を適宜改行
+                if len(txt) > srt_max_line:
+                    # 単純分割（日本語はスペース無いこと多いので幅で切る）
+                    lines = [txt[i:i+srt_max_line] for i in range(0, len(txt), srt_max_line)]
+                    txt_fmt = '\n'.join(lines)
+                else:
+                    txt_fmt = txt
+                blocks.append(f"{idx}\n{to_srt_timestamp(st)} --> {to_srt_timestamp(ed)}\n{txt_fmt}\n")
+            return '\n'.join(blocks)
+        elif output_format == 'jsonl':
+            return '\n'.join(json.dumps(e, ensure_ascii=False) for e in jsonl_entries)
+        else:
+            print(f"[WARN] 未知の output_format '{output_format}' -> txt で出力")
+            return '\n'.join(output_lines)
     
     finally:
         # 一時ファイルを削除
@@ -367,14 +540,21 @@ def main():
     parser.add_argument('video_path', help='処理する動画ファイル（mp4）のパス')
     parser.add_argument('--model', default='large', choices=['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'],
                        help='使用するWhisperモデルのサイズ（デフォルト: large）')
-    parser.add_argument('--output', '-o', help='出力テキストファイルのパス（指定しない場合は標準出力）')
+    parser.add_argument('--output', '-o', help='出力ファイルのパス。未指定なら output/ 元動画ファイル名 + 拡張子(出力形式) で自動保存')
     parser.add_argument('--ja-weight', type=float, default=1.0, help='日本語確率へ乗算する重み (デフォルト1.0)')
     parser.add_argument('--ru-weight', type=float, default=1.0, help='ロシア語確率へ乗算する重み (デフォルト1.0)')
-    parser.add_argument('--ambiguous-threshold', type=float, default=10.0, help='あいまい再トライを行う確率差しきい値(%)')
+    parser.add_argument('--ambiguous-threshold', type=float, default=10.0, help='あいまい再トライを行う確率差しきい値(パーセント)')
     parser.add_argument('--vad-level', type=int, default=2, choices=[0,1,2,3], help='VAD 厳しさ (0=寛容,3=厳格)')
     parser.add_argument('--include-silent', action='store_true', help='スキップされた無音/短すぎ/空テキストもプレースホルダ表示')
     parser.add_argument('--debug-segments', action='store_true', help='デバッグ: 各セグメントの判定理由を表示')
     parser.add_argument('--gap-threshold', type=float, default=0.35, help='ギャップ挿入の下限秒数 (include-silent時)')
+    parser.add_argument('--seg-mode', choices=['auto','hybrid'], default='auto', help='セグメント生成方式: auto=従来1パス, hybrid=ja/ru二重パス境界統合')
+    parser.add_argument('--min-seg-dur', type=float, default=0.25, help='hybrid 方式で残す最短区間秒数')
+    parser.add_argument('--lowconf-logprob', type=float, default=None, help='avg_logprob がこの値未満のセグメントを word 再分割 (auto モードのみ)')
+    parser.add_argument('--mix-threshold', type=float, default=5.0, help='JA/RU 確率差がこの値未満なら [MIX] タグ付与')
+    parser.add_argument('--output-format', choices=['txt','srt','jsonl'], default='txt', help='出力フォーマット')
+    parser.add_argument('--seg-model', dest='segmentation_model_size', help='二段モデル: セグメント生成専用モデル (例: small)')
+    parser.add_argument('--srt-max-line', type=int, default=42, help='SRT 出力時の1行最大文字数（超過で任意位置改行）')
     
     args = parser.parse_args()
     
@@ -393,17 +573,33 @@ def main():
         vad_level=args.vad_level,
         include_silent=args.include_silent,
         debug_segments=args.debug_segments,
-        gap_threshold=args.gap_threshold
+        gap_threshold=args.gap_threshold,
+        seg_mode=args.seg_mode,
+        min_seg_dur=args.min_seg_dur,
+        lowconf_logprob=args.lowconf_logprob,
+        mix_threshold=args.mix_threshold,
+        output_format=args.output_format,
+        segmentation_model_size=args.segmentation_model_size,
+        srt_max_line=args.srt_max_line
     )
     
-    # 結果を出力
+    # 出力パス決定
     if args.output:
-        output_path = Path(args.output)
-        output_path.write_text(result, encoding='utf-8')
-        print(f"\n結果を {args.output} に保存しました")
+        out_path = Path(args.output)
     else:
-        print("\n=== 文字起こし結果 ===")
-        print(result)
+        # 自動決定: output/<video_stem>.<ext>
+        video_stem = Path(args.video_path).stem
+        ext = args.output_format if args.output_format != 'txt' else 'txt'
+        out_dir = Path('output')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{video_stem}.{ext}"
+
+    if not out_path.parent.exists():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(result, encoding='utf-8')
+    print(f"\n保存先: {out_path}")
+    if not args.output:
+        print("( --output 未指定のため自動保存 )")
 
 if __name__ == "__main__":
     main()
