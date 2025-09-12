@@ -1,12 +1,14 @@
 python .\transcription_for_kapra.py `
 "video\「起きて！」って日本語とロシア語で？～二カ国語を喋る幼馴染がことわざを言いながら起こしてくる朝～.mp4" `
---seg-model small `
+--ja-weight 0.80 `
+--ru-weight 1.25 `
+--seg-model turbo `
 --model large-v3 `
 --seg-mode hybrid `
---min-seg-dur 0.40 `
+--min-seg-dur 0.60 `
 --mix-threshold 6 `
---output-format srt `
+--output-format txt `
 --srt-max-line 50 `
 --ambiguous-threshold 10 `
---vad-level 2
---output
+--vad-level 2 `
+--gap-threshold 0.5
