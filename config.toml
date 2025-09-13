@@ -1,33 +1,68 @@
 [default]
-# ===== 基本設定 (GUI: 基本設定グループ順) =====
-# device: 使用するデバイス (cpu / cuda)
-device = "cuda"
-# transcription_model: 使用するメイン Whisper モデル名 (例: tiny, base, small, medium, large, large-v2, large-v3)
-transcription_model = "large-v3"
-# segmentation_model: セグメント分割用モデルサイズ (turbo / small など)。未調整なら "turbo" 推奨
-segmentation_model = "turbo"
-# default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
-default_languages = ["ja", "ru"]
+    # ===== 基本設定 (GUI: 基本設定グループ順) =====
+    # device: 使用するデバイス (cpu / cuda)
+    device = "cuda"
+    # transcription_model: 使用するメイン Whisper モデル名 (例: tiny, base, small, medium, large, large-v2, large-v3)
+    transcription_model = "large-v3"
+    # segmentation_model: セグメント分割用モデルサイズ (turbo / small など)。未調整なら "turbo" 推奨
+    segmentation_model = "turbo"
+    # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
+    default_languages = ["ja"]
 
-# ===== 言語ウェイト (GUI: 言語設定) =====
-# ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
-ja_weight = 0.80
-ru_weight = 1.25
+    # ===== 言語ウェイト (GUI: 言語設定) =====
+    # ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
+    ja_weight = 1.00
+    ru_weight = 1.00
 
-# ===== 詳細設定 (GUI: 詳細設定 生成順) =====
-# min_seg_dur: 1セグメントの最小継続時間(秒)
-min_seg_dur = 0.60
-# vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
-vad_level = 2
-# gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
-gap_threshold = 0.5
-# ambiguous_threshold: JA/RU スコア差がこの値未満なら両言語再トライ
-ambiguous_threshold = 30.0
-# include_silent: スキップ/無音情報を出力へ含めるか
-include_silent = true
-# srt_max_line: SRT 化する際の最大行数目安
-srt_max_line = 50
-# output_format: 出力形式候補 "txt" / "srt" / "json"
-output_format = "txt"
-# initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
-initial_prompt = "風見カプラ Всем Привет Казами Капра"
+    # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
+    # min_seg_dur: 1セグメントの最小継続時間(秒)
+    min_seg_dur = 0.60
+    # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
+    vad_level = 2
+    # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
+    gap_threshold = 0.5
+    # ambiguous_threshold: JA/RU スコア差がこの値未満なら両言語再トライ
+    ambiguous_threshold = 30.0
+    # include_silent: スキップ/無音情報を出力へ含めるか
+    include_silent = true
+    # srt_max_line: SRT 化する際の最大行数目安
+    srt_max_line = 50
+    # output_format: 出力形式候補 "txt" / "srt" / "json"
+    output_format = "txt"
+    # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
+    initial_prompt = ""
+
+[kapra]
+    # ===== 基本設定 (GUI: 基本設定グループ順) =====
+    # device: 使用するデバイス (cpu / cuda)
+    device = "cuda"
+    # transcription_model: 使用するメイン Whisper モデル名 (例: tiny, base, small, medium, large, large-v2, large-v3)
+    transcription_model = "large-v3"
+    # segmentation_model: セグメント分割用モデルサイズ (turbo / small など)。未調整なら "turbo" 推奨
+    segmentation_model = "turbo"
+    # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
+    default_languages = ["ja", "ru"]
+
+    # ===== 言語ウェイト (GUI: 言語設定) =====
+    # ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
+    ja_weight = 0.80
+    ru_weight = 1.25
+
+    # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
+    # min_seg_dur: 1セグメントの最小継続時間(秒)
+    min_seg_dur = 0.60
+    # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
+    vad_level = 2
+    # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
+    gap_threshold = 0.5
+    # ambiguous_threshold: JA/RU スコア差がこの値未満なら両言語再トライ
+    ambiguous_threshold = 30.0
+    # include_silent: スキップ/無音情報を出力へ含めるか
+    include_silent = true
+    # srt_max_line: SRT 化する際の最大行数目安
+    srt_max_line = 50
+    # output_format: 出力形式候補 "txt" / "srt" / "json"
+    output_format = "txt"
+    # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
+    initial_prompt = "風見カプラ Всем Привет Казами Капра"
+

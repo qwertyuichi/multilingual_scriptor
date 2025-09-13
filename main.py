@@ -346,13 +346,20 @@ class VideoTranscriptionApp(QMainWindow):
         model_group = QGroupBox("基本設定")
         model_layout = QGridLayout()
 
-        label_setting_item = QLabel("設定項目:")
+        label_setting_item = QLabel("プロファイル:")
         model_layout.addWidget(label_setting_item, 0, 0)
-        self.setting_item_combo = QComboBox()
-        setting_items = list(self.config["default"].keys())
-        self.setting_item_combo.addItems(setting_items)
-        model_layout.addWidget(self.setting_item_combo, 0, 1)
+        self.profile_combo = QComboBox()
+        # config の第一階層セクションをプロファイル候補とする
+        self.profiles = [k for k, v in self.config.items() if isinstance(v, dict)]
+        # default を先頭、それ以外はアルファベット順
+        ordered_profiles = [p for p in self.profiles if p == 'default'] + sorted(
+            [p for p in self.profiles if p != 'default']
+        )
+        self.profiles = ordered_profiles
+        self.profile_combo.addItems(self.profiles)
+        model_layout.addWidget(self.profile_combo, 0, 1)
         model_layout.addWidget(help_label("設定項目"), 0, 2)
+        self.current_profile_name = 'default'
 
         dev_label = QLabel("デバイス:")
         model_layout.addWidget(dev_label, 1, 0)
@@ -402,67 +409,121 @@ class VideoTranscriptionApp(QMainWindow):
         scroll_layout.addWidget(model_group)
 
         # 言語設定
+        dft = self.config.get(self.current_profile_name, {})  # プロファイル辞書再取得
         lang_group = QGroupBox("言語設定")
         lang_layout = QVBoxLayout()
 
-        # 言語 + weight スライダー
-        dft = self.config.get("default", {})
-        dlangs = dft.get("default_languages", ["ja", "ru"])
-        if not isinstance(dlangs, list) or not dlangs:
-            dlangs = ["ja"]
+        def build_language_rows(profile_dict):
+            # 既存行をクリアする場合は将来対応（現状は初期化時のみ呼ぶ）
+            dlangs_local = profile_dict.get("default_languages", ["ja", "ru"])
+            if not isinstance(dlangs_local, list) or not dlangs_local:
+                dlangs_local = ["ja"]
 
-        def make_lang_row(code: str, label_text: str, default_weight_key: str):
-            row = QWidget()
-            hl = QHBoxLayout(row)
-            hl.setContentsMargins(0, 0, 0, 0)
-            chk = QCheckBox(label_text)
-            chk.setChecked(code in dlangs)
-            slider = QSlider(Qt.Horizontal)
-            slider.setMinimum(0)
-            slider.setMaximum(300)
-            slider.setSingleStep(5)
-            slider.setFixedWidth(140)
-            val = dft.get(default_weight_key, 1.0)
-            if not isinstance(val, (int, float)):
-                val = 1.0
-            slider.setValue(int(round(val * 100)))  # 1.00 -> 100
-            value_label = QLabel(f"{val:.2f}")
+            def make_lang_row(code: str, label_text: str, default_weight_key: str):
+                row = QWidget()
+                hl = QHBoxLayout(row)
+                hl.setContentsMargins(0, 0, 0, 0)
+                chk = QCheckBox(label_text)
+                chk.setChecked(code in dlangs_local)
+                slider = QSlider(Qt.Horizontal)
+                slider.setMinimum(0)
+                slider.setMaximum(300)
+                slider.setSingleStep(5)
+                slider.setFixedWidth(140)
+                val = profile_dict.get(default_weight_key, 1.0)
+                if not isinstance(val, (int, float)):
+                    val = 1.0
+                slider.setValue(int(round(val * 100)))
+                value_label = QLabel(f"{val:.2f}")
 
-            def on_change(v):
-                value_label.setText(f"{v/100:.2f}")
+                def on_change(v):
+                    value_label.setText(f"{v/100:.2f}")
 
-            slider.valueChanged.connect(on_change)
-            hl.addWidget(chk)
-            weight_lbl = QLabel("weight")
-            hl.addWidget(weight_lbl)
-            hl.addWidget(slider)
-            hl.addWidget(value_label)
-            # ヘルプマーク
-            hl.addWidget(help_label(default_weight_key))
-            return chk, slider, value_label, row
+                slider.valueChanged.connect(on_change)
+                hl.addWidget(chk)
+                weight_lbl = QLabel("weight")
+                hl.addWidget(weight_lbl)
+                hl.addWidget(slider)
+                hl.addWidget(value_label)
+                hl.addWidget(help_label(default_weight_key))
+                return chk, slider, value_label, row
 
-        self.ja_check, self.ja_slider_label_dummy, self.ja_weight_value_label_dummy = (
-            None,
-            None,
-            None,
-        )
-        (
-            self.ja_check,
-            self.ja_weight_slider_label_dummy,
-            self.ja_weight_value_label_dummy,
-            ja_row,
-        ) = make_lang_row("ja", "JA", "ja_weight")
-        self.ja_weight_slider = ja_row.findChildren(QSlider)[0]
-        self.ja_weight_value_label = ja_row.findChildren(QLabel)[-1]
-        lang_layout.addWidget(ja_row)
+            (
+                self.ja_check,
+                self.ja_weight_slider_label_dummy,
+                self.ja_weight_value_label_dummy,
+                ja_row,
+            ) = make_lang_row("ja", "JA", "ja_weight")
+            self.ja_weight_slider = ja_row.findChildren(QSlider)[0]
+            self.ja_weight_value_label = ja_row.findChildren(QLabel)[-1]
+            lang_layout.addWidget(ja_row)
 
-        self.ru_check, _, _, ru_row = make_lang_row("ru", "RU", "ru_weight")
-        self.ru_weight_slider = ru_row.findChildren(QSlider)[0]
-        self.ru_weight_value_label = ru_row.findChildren(QLabel)[-1]
-        lang_layout.addWidget(ru_row)
+            self.ru_check, _, _, ru_row = make_lang_row("ru", "RU", "ru_weight")
+            self.ru_weight_slider = ru_row.findChildren(QSlider)[0]
+            self.ru_weight_value_label = ru_row.findChildren(QLabel)[-1]
+            lang_layout.addWidget(ru_row)
 
+        # 初期プロファイルで構築
+        build_language_rows(dft)
         lang_group.setLayout(lang_layout)
         scroll_layout.addWidget(lang_group)
+
+        # プロファイル適用ロジック
+        def apply_profile(name: str):
+            if name not in self.config:
+                return
+            prof = self.config.get(name, {})
+            self.current_profile_name = name
+            # デバイス
+            dev = prof.get("device")
+            if dev and dev in [self.device_combo.itemText(i) for i in range(self.device_combo.count())]:
+                self.device_combo.setCurrentText(dev)
+            # モデル
+            tmodel = prof.get("transcription_model")
+            if tmodel and tmodel in [self.model_combo.itemText(i) for i in range(self.model_combo.count())]:
+                self.model_combo.setCurrentText(tmodel)
+            # セグメンテーションモデル
+            smodel = prof.get("segmentation_model")
+            if smodel and smodel in [self.segmentation_model_combo.itemText(i) for i in range(self.segmentation_model_combo.count())]:
+                self.segmentation_model_combo.setCurrentText(smodel)
+            # 言語チェック & weight
+            dlangs_prof = prof.get("default_languages", [])
+            if self.ja_check:
+                self.ja_check.setChecked("ja" in dlangs_prof or (not dlangs_prof and True))
+            if self.ru_check:
+                self.ru_check.setChecked("ru" in dlangs_prof)
+            if self.ja_weight_slider:
+                ja_w = prof.get("ja_weight", 1.0)
+                if isinstance(ja_w, (int, float)):
+                    self.ja_weight_slider.setValue(int(round(ja_w * 100)))
+            if self.ru_weight_slider:
+                ru_w = prof.get("ru_weight", 1.0)
+                if isinstance(ru_w, (int, float)):
+                    self.ru_weight_slider.setValue(int(round(ru_w * 100)))
+            # 詳細設定ウィジェット (初期化後に detail_controls が埋まる)
+            for key, ctrl in getattr(self, 'detail_controls', {}).items():
+                if key not in prof:
+                    continue
+                val = prof[key]
+                from PySide6.QtWidgets import QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QComboBox
+                if isinstance(ctrl, QCheckBox) and isinstance(val, bool):
+                    ctrl.setChecked(val)
+                elif isinstance(ctrl, QSpinBox) and isinstance(val, int):
+                    ctrl.setValue(val)
+                elif isinstance(ctrl, QDoubleSpinBox) and isinstance(val, (int, float)):
+                    ctrl.setValue(float(val))
+                elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
+                    ctrl.setText(val)
+                elif isinstance(ctrl, QTextEdit) and isinstance(val, str):
+                    ctrl.setPlainText(val)
+                elif isinstance(ctrl, QComboBox) and isinstance(val, str):
+                    # 候補に無ければ追加
+                    if ctrl.findText(val) < 0:
+                        ctrl.addItem(val)
+                    ctrl.setCurrentText(val)
+
+        # プロファイル変更シグナル
+        self.profile_combo.currentTextChanged.connect(apply_profile)
 
         # 詳細設定 (config.toml の default セクションから、基本設定で使ったキーを除外して動的生成)
         detail_group = QGroupBox("詳細設定")
