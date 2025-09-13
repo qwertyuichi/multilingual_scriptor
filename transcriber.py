@@ -1,6 +1,51 @@
+"""Transcription processing module.
+
+リファクタリング方針:
+ - 機能は現状(高度処理のみ)を維持
+ - 冗長ロジックの関数分割
+ - 型ヒント / ドキュメント整備
+ - コメントは意味が重複するものを簡潔化し、役割が曖昧な箇所は明確化
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+import logging
+import os
+import tempfile
+import subprocess
+from datetime import timedelta
+import traceback
+
+import numpy as np
+import torch
+import whisper
+import webrtcvad
+from scipy.io import wavfile
+from PySide6.QtCore import QThread, Signal
+
+# ============================================================
+# ロギング設定
+# ============================================================
+
+logger = logging.getLogger(__name__)
+# ここではハンドラを追加せず、アプリ起動側(main.py)の root ロガー設定を利用する。
+# (以前はここで StreamHandler を追加していたため二重出力になっていた)
+
+# ============================================================
+# 文字列 / 後処理ユーティリティ
+# ============================================================
+
 def clean_hallucination(text: str, max_repeat: int = 8) -> str:
-    """1文字が極端に繰り返されている場合縮約。連続30文字以上の同種があれば警告タグ。"""
-    cleaned = []
+    """出力されたテキストの簡易クレンジング。
+
+    - 同一文字が *max_repeat* を超えて連続する場合は切り詰め
+    - 30 文字以上の連続ブロック(空白区切り) があれば先頭を残し警告タグ付与
+    """
+    if not text:
+        return text
+    cleaned: list[str] = []
     prev = ''
     count = 0
     for ch in text:
@@ -13,60 +58,53 @@ def clean_hallucination(text: str, max_repeat: int = 8) -> str:
             count = 1
             cleaned.append(ch)
     out = ''.join(cleaned)
-    # 連続で30文字以上の同種(句読点/同字)があれば警告タグ
     if any(len(block) >= 30 for block in out.split()):
-        out = '[HALLUCINATION?] ' + out[:120]
+        return '[HALLUCINATION?] ' + out[:120]
     return out
-import whisper
-import torch
-from PySide6.QtCore import QThread, Signal
-import os
-import json
-import tempfile
-import subprocess
-from pathlib import Path
-import numpy as np
-from scipy.io import wavfile
-import webrtcvad
-from datetime import timedelta
-import traceback
 
 # =============== 高度処理用ユーティリティ (reference/transcription_for_kapra.py から抽出/簡略化) ===============
 
-def _extract_audio(video_path: str, output_audio_path: str):
+def _extract_audio(video_path: str, output_audio_path: str) -> None:
+    """動画から 16kHz mono PCM wav を抽出。
+    ffmpeg エラーは呼び出し側で例外として扱う。"""
     cmd = [
-        'ffmpeg','-i', video_path,
-        '-vn','-acodec','pcm_s16le','-ar','16000','-ac','1','-y',output_audio_path
+        'ffmpeg', '-i', video_path,
+        '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+        '-y', output_audio_path
     ]
     subprocess.run(cmd, check=True, capture_output=True)
 
-def _build_hybrid_segments(model, audio_path: str, min_seg_dur: float = 0.25):
-    print("[ADV] Hybrid segmentation ...")
-    ja_res = model.transcribe(audio_path, language='ja', verbose=False, condition_on_previous_text=False,
-                              word_timestamps=False, task='transcribe')
-    ru_res = model.transcribe(audio_path, language='ru', verbose=False, condition_on_previous_text=False,
-                              word_timestamps=False, task='transcribe')
-    points = set()
+def _build_hybrid_segments(model, audio_path: str, min_seg_dur: float = 0.25) -> list[dict]:
+    """JA/RU それぞれを一度走らせて start/end 点を統合し最小長フィルタ。
+
+    Whisper 自体のセグメント境界を粗結合する簡易ハイブリッド方式。
+    """
+    logger.debug("[ADV] Hybrid segmentation ...")
+    common_kw = dict(verbose=False, condition_on_previous_text=False,
+                     word_timestamps=False, task='transcribe')
+    ja_res = model.transcribe(audio_path, language='ja', **common_kw)
+    ru_res = model.transcribe(audio_path, language='ru', **common_kw)
+    points: set[float] = set()
     for seg in ja_res.get('segments', []):
-        points.add(round(float(seg['start']), 2)); points.add(round(float(seg['end']), 2))
+        points.update({round(float(seg['start']), 2), round(float(seg['end']), 2)})
     for seg in ru_res.get('segments', []):
-        points.add(round(float(seg['start']), 2)); points.add(round(float(seg['end']), 2))
+        points.update({round(float(seg['start']), 2), round(float(seg['end']), 2)})
     pts = sorted(p for p in points if p >= 0)
-    merged = []
-    for i in range(len(pts)-1):
-        st, ed = pts[i], pts[i+1]
-        if ed - st >= min_seg_dur:
-            merged.append({'start': st, 'end': ed})
+    merged: list[dict] = []
+    for a, b in zip(pts, pts[1:]):
+        if (b - a) >= min_seg_dur:
+            merged.append({'start': a, 'end': b})
     if not merged:
         return [{'start': s['start'], 'end': s['end']} for s in ja_res.get('segments', [])]
     return merged
 
 def _has_voice(segment: np.ndarray, sample_rate: int = 16000, vad_level: int = 2) -> bool:
+    """簡易 VAD。一定長未満は肯定。WebRTC VAD で 30ms フレーム判定。"""
     if len(segment) < sample_rate * 0.2:
         return True
     vad = webrtcvad.Vad(vad_level)
-    frame_dur = 30
-    frame_size = int(sample_rate * frame_dur / 1000)
+    frame_dur_ms = 30
+    frame_size = int(sample_rate * frame_dur_ms / 1000)
     pcm16 = (np.clip(segment, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
     for offset in range(0, len(pcm16), frame_size * 2):
         frame = pcm16[offset: offset + frame_size * 2]
@@ -76,162 +114,207 @@ def _has_voice(segment: np.ndarray, sample_rate: int = 16000, vad_level: int = 2
             return True
     return False
 
-def _detect_lang_probs(model, audio_segment, ja_weight=1.0, ru_weight=1.0, ru_accent_boost: float = 0.0):
-    """JA/RU の言語確率のみを取得し、重み補正後に返す。ENは無視。"""
-    # reference版と同じpad/trimming・例外時pad再試行方式
+def _detect_lang_probs(model, audio_segment: np.ndarray | torch.Tensor,
+                       ja_weight: float = 1.0, ru_weight: float = 1.0) -> tuple[str, float, float]:
+    """JA / RU 言語確率 (簡易) を取得し重み補正後に百分率で返す。
+
+    例外時はデフォルト 50/50 フォールバック。EN 等は無視し 2 クラス正規化。
+    """
     sr = 16000
-    min_len = sr * 2
-    max_len = sr * 30
     if isinstance(audio_segment, torch.Tensor):
         audio_segment = audio_segment.detach().cpu().numpy()
     audio_segment = np.asarray(audio_segment).flatten().astype(np.float32)
-    length = len(audio_segment)
-    if length < min_len:
+    # 長さ補正 (pad/trim)
+    min_len = sr * 2
+    max_len = sr * 30
+    if audio_segment.size < min_len:
         audio_segment = whisper.pad_or_trim(audio_segment, min_len)
-    elif length > max_len:
+    elif audio_segment.size > max_len:
         audio_segment = whisper.pad_or_trim(audio_segment, max_len)
-    # モデルが期待するメルバンド数を動的取得
+    # メル次元推定
     try:
-        if hasattr(model, 'dims') and hasattr(model.dims, 'n_mels'):
-            expected_mels = model.dims.n_mels
-        else:
+        expected_mels = getattr(getattr(model, 'dims', object()), 'n_mels', None)
+        if not isinstance(expected_mels, int):
             expected_mels = model.encoder.conv1.weight.shape[1]
         if not isinstance(expected_mels, int):
             expected_mels = 80
     except Exception:
         expected_mels = 80
-    # 期待メル数に合わせて計算
-    try:
-        mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
-    except TypeError:
-        mel = whisper.log_mel_spectrogram(audio_segment).to(model.device)
-    except AssertionError:
-        audio_segment = np.asarray(audio_segment).flatten().astype(np.float32)
-        mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
-    if mel.shape[0] not in (expected_mels, 80):
+    # スペクトログラム計算 (互換フォールバック付き)
+    def build_mel(arr: np.ndarray):
         try:
-            mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
+            return whisper.log_mel_spectrogram(arr, n_mels=expected_mels).to(model.device)
+        except TypeError:
+            return whisper.log_mel_spectrogram(arr).to(model.device)
+        except AssertionError:
+            arr = np.asarray(arr).flatten().astype(np.float32)
+            return whisper.log_mel_spectrogram(arr, n_mels=expected_mels).to(model.device)
+    mel = build_mel(audio_segment)
+    if mel.shape[0] not in (expected_mels, 80):  # 再試行(稀ケース)
+        try:
+            mel = build_mel(audio_segment)
         except Exception:
             pass
     # 言語検出
     try:
         with torch.no_grad():
             _, probs = model.detect_language(mel)
-        print(f"[LANG_PROB] probs={probs}")
+        logger.debug(f"[LANG_PROB] probs={probs}")
     except Exception as e:
-        # フォールバック: 30秒pad + mel再試行
         try:
             padded = whisper.pad_or_trim(audio_segment, sr * 30)
-            mel2 = whisper.log_mel_spectrogram(padded, n_mels=expected_mels).to(model.device)
+            mel2 = build_mel(padded)
             with torch.no_grad():
                 _, probs = model.detect_language(mel2)
         except Exception:
-            print(f"[LANG_PROB][EXCEPTION] {e}. fallback probs={{'ja':0.5,'ru':0.5}}")
-            probs = {'ja':0.5,'ru':0.5}
-    ja_raw = float(probs.get('ja',0.0))
-    ru_raw = float(probs.get('ru',0.0))
-    # 重み補正 (正規化)
+            logger.warning(f"[LANG_PROB][EXCEPTION] {e}. fallback probs={{'ja':0.5,'ru':0.5}}")
+            probs = {'ja': 0.5, 'ru': 0.5}
+    ja_raw = float(probs.get('ja', 0.0))
+    ru_raw = float(probs.get('ru', 0.0))
     ja_adj = ja_raw * ja_weight
     ru_adj = ru_raw * ru_weight
     denom = ja_adj + ru_adj
-    if denom > 0:
-        ja_prob = ja_adj / denom * 100.0
-        ru_prob = ru_adj / denom * 100.0
-    else:
-        ja_prob = ru_prob = 50.0
-    if ru_accent_boost > 0 and ru_prob < ja_prob:
-        ru_prob = min(100.0, ru_prob + ru_accent_boost)
-    detected_lang = 'ja' if ja_prob >= ru_prob else 'ru'
-    return detected_lang, ja_prob, ru_prob
+    if denom <= 0:
+        return 'ja', 50.0, 50.0
+    ja_prob = ja_adj / denom * 100.0
+    ru_prob = ru_adj / denom * 100.0
+    lang = 'ja' if ja_prob >= ru_prob else 'ru'
+    return lang, ja_prob, ru_prob
 
-def _transcribe_clip(model, audio_segment, language):
+def _transcribe_clip(model, audio_segment: np.ndarray, language: str):
+    """1 クリップを一時 WAV に書き出し whisper へ渡して文字起こし。
+
+    直接 numpy から与えるインターフェースが安定していないため WAV 経由。
+    """
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        wavfile.write(tmp_path, 16000, (audio_segment*32767).astype(np.int16))
-        res = model.transcribe(tmp_path, language=language, temperature=0.2, no_speech_threshold=0.6,
-                               logprob_threshold=-1.0, verbose=False, condition_on_previous_text=False,
-                               task='transcribe')
-        return res
+        wavfile.write(tmp_path, 16000, (audio_segment * 32767).astype(np.int16))
+        return model.transcribe(
+            tmp_path,
+            language=language,
+            temperature=0.2,
+            no_speech_threshold=0.6,
+            logprob_threshold=-1.0,
+            verbose=False,
+            condition_on_previous_text=False,
+            task='transcribe'
+        )
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 def advanced_process_video(
-        video_path: str,
-        model_size: str = 'large-v3',
-        segmentation_model_size: str | None = 'turbo',
-        seg_mode: str = 'hybrid',
-        ja_weight: float = 0.80,
-        ru_weight: float = 1.25,
-        ru_accent_boost: float = 0.0,
-        min_seg_dur: float = 0.60,
-        ambiguous_threshold: float = 10.0,
-        vad_level: int = 2,
-        gap_threshold: float = 0.5,
-        output_format: str = 'txt',
-        srt_max_line: int = 50,
-        include_silent: bool = False,
-        debug: bool = False,
-        progress_callback=None,
-    ) -> dict:
+    video_path: str,
+    model_size: str = 'large-v3',
+    segmentation_model_size: str | None = 'turbo',
+    seg_mode: str = 'hybrid',
+    device: str | None = None,
+    ja_weight: float = 0.80,
+    ru_weight: float = 1.25,
+    min_seg_dur: float = 0.60,
+    ambiguous_threshold: float = 10.0,
+    vad_level: int = 2,
+    gap_threshold: float = 0.5,
+    output_format: str = 'txt',
+    srt_max_line: int = 50,
+    include_silent: bool = False,
+    debug: bool = False,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    cancel_flag: Optional[Callable[[], bool]] = None,
+) -> dict:
     """動画を高度ルールで処理し GUI 互換の結果 dict を返す。
     戻り値: {'text': str, 'segments': [{'start','end','text','id'}], 'language': 'mixed'}
     """
-    print('[ADV] loading models ...')
+    # ログレベル切替 (debug引数) - root ロガーを調整して全体反映
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    logger.info('[ADV] loading models ...')  # モデルロードログ
+    # デバイス決定 (None の場合は自動)
+    selected_device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    if selected_device == 'cuda' and not torch.cuda.is_available():
+        logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
+        selected_device = 'cpu'
+    logger.info(f'[DEVICE] using device={selected_device}')
+    load_kw = {'device': selected_device}
+    if status_callback:
+        status_callback('モデル読み込み中...')
     if segmentation_model_size:
-        seg_model = whisper.load_model(segmentation_model_size)
-        model = whisper.load_model(model_size)
+        seg_model = whisper.load_model(segmentation_model_size, **load_kw)
+        model = whisper.load_model(model_size, **load_kw)
     else:
-        model = whisper.load_model(model_size)
+        model = whisper.load_model(model_size, **load_kw)
         seg_model = model
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_aud:
         audio_path = tmp_aud.name
     try:
+        if status_callback:
+            status_callback('音声抽出中...')
         _extract_audio(video_path, audio_path)
         full_audio = whisper.load_audio(audio_path)
-        if seg_mode == 'hybrid':
+        if status_callback:
+            status_callback('セグメント解析中...')
+        if seg_mode == 'hybrid':  # JA/RU 二重走査で境界統合
             segs = _build_hybrid_segments(seg_model, audio_path, min_seg_dur=min_seg_dur)
             initial_segments = [{'start': s['start'], 'end': s['end']} for s in segs]
-        else:
-            res = seg_model.transcribe(audio_path, language=None, verbose=False, word_timestamps=False,
-                                       condition_on_previous_text=False, task='transcribe')
-            initial_segments = [{'start': s['start'], 'end': s['end']} for s in res.get('segments', [])]
+        else:  # Whisper デフォルト分割
+            res = seg_model.transcribe(
+                audio_path, language=None, verbose=False,
+                word_timestamps=False, condition_on_previous_text=False,
+                task='transcribe'
+            )
+            initial_segments = [
+                {'start': s['start'], 'end': s['end']} for s in res.get('segments', [])
+            ]
         output_lines = []
         gui_segments = []
         srt_entries = []
         jsonl_entries = []
         prev_end = 0.0
         idx = 0
+        total_segments = len(initial_segments)
         for seg in initial_segments:
-            # 進捗を10%→90%で細かくemit
-            if progress_callback is not None:
-                prog = 10 + int(80 * (idx + 1) / len(initial_segments)) if len(initial_segments) > 0 else 10
+            if cancel_flag and cancel_flag():
+                if status_callback:
+                    status_callback('キャンセル中...')
+                break
+            # 進捗を10%→90%で線形更新
+            if progress_callback is not None and initial_segments:
+                prog = 10 + int(80 * (idx + 1) / len(initial_segments))
                 progress_callback(prog)
-            st = seg['start']; ed = seg['end']
+            if status_callback and total_segments:
+                # 過剰な描画を避けるため 50 ステップ or 各1件レベルで更新
+                step = max(1, total_segments // 50)
+                if (idx % step) == 0:
+                    status_callback(f'文字起こし中... ({idx+1}/{total_segments})')
+            st = seg['start']; ed = seg['end']  # 秒
             gap = st - prev_end
             if include_silent and gap >= gap_threshold and prev_end>0:
                 output_lines.append(f"[GAP {gap:.2f}s]")
             prev_end = ed
-            start_sample = int(st*16000); end_sample = int(ed*16000)
-            start_sample = max(0,start_sample); end_sample = min(len(full_audio), end_sample)
-            if end_sample <= start_sample: continue
+            start_sample = max(0, int(st * 16000))
+            end_sample = min(len(full_audio), int(ed * 16000))
+            if end_sample <= start_sample:
+                continue
             clip = full_audio[start_sample:end_sample].astype(np.float32)
-            if len(clip) < 16000*0.1:
-                if include_silent: output_lines.append(f"[SKIP short {st:.2f}-{ed:.2f}]")
+            if len(clip) < 16000 * 0.1:  # 100ms 未満はスキップ
+                if include_silent:
+                    output_lines.append(f"[SKIP short {st:.2f}-{ed:.2f}]")
                 continue
             if not _has_voice(clip, vad_level=vad_level):
-                if include_silent: output_lines.append(f"[SKIP silence {st:.2f}-{ed:.2f}]")
+                if include_silent:
+                    output_lines.append(f"[SKIP silence {st:.2f}-{ed:.2f}]")
                 continue
             # クリップshapeチェック・値確認（リサンプリングは行わずpad/trimmingのみ）
             if not isinstance(clip, np.ndarray) or clip.ndim != 1 or clip.size == 0:
-                print(f"[SKIP] invalid clip shape: {clip.shape}")
+                logger.debug(f"[SKIP] invalid clip shape: {clip.shape}")
                 continue
             detected_lang, ja_prob, ru_prob = _detect_lang_probs(
-                model, clip, ja_weight, ru_weight, ru_accent_boost=ru_accent_boost
+                model, clip, ja_weight, ru_weight
             )
             amb = abs(ja_prob - ru_prob) < ambiguous_threshold
-            if amb:
+            if amb:  # あいまい時は JA/RU 両方再トライ
                 ja_res = _transcribe_clip(model, clip, 'ja')
                 ru_res = _transcribe_clip(model, clip, 'ru')
                 def safe_avg_logprob(res):
@@ -241,7 +324,7 @@ def advanced_process_video(
                     return segs[0].get('avg_logprob', -9999.0)
                 ja_score = safe_avg_logprob(ja_res)
                 ru_score = safe_avg_logprob(ru_res)
-                ja_text = ja_res.get('text','').strip(); ru_text = ru_res.get('text','').strip()
+                ja_text = ja_res.get('text', '').strip(); ru_text = ru_res.get('text', '').strip()
                 if ja_score == ru_score:
                     if len(ja_text) >= len(ru_text):
                         detected_lang, seg_text = 'ja', ja_text
@@ -258,15 +341,14 @@ def advanced_process_video(
                 continue
             seg_text = clean_hallucination(seg_text)
             # [MIX]機能削除
-            def fmt_ts(t: float):
+            def fmt_ts(t: float) -> str:
                 td = timedelta(seconds=t)
                 total_seconds = td.total_seconds()
                 h = int(total_seconds // 3600)
                 m = int((total_seconds % 3600) // 60)
                 s = total_seconds % 60
                 return f"{h:02d}:{m:02d}:{s:06.3f}"
-            ts_start = fmt_ts(st)
-            ts_end = fmt_ts(ed)
+            ts_start, ts_end = fmt_ts(st), fmt_ts(ed)
             line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] {seg_text}".strip()
             output_lines.append(line)
             gui_segments.append({'start': st, 'end': ed, 'text': seg_text, 'id': idx, 'ja_prob': ja_prob, 'ru_prob': ru_prob})
@@ -283,32 +365,41 @@ def advanced_process_video(
                 'language': detected_lang
             })
             idx += 1
+        if status_callback:
+            status_callback('出力整形中...')
         full_text = '\n'.join(output_lines)
         # SRT/JSONL出力対応
+        if cancel_flag and cancel_flag():
+            if status_callback:
+                status_callback('キャンセル完了 (部分結果)')
         if output_format == 'srt':
-            def to_srt_timestamp(sec: float):
+            def to_srt_timestamp(sec: float) -> str:
                 h = int(sec // 3600)
                 m = int((sec % 3600) // 60)
                 s = int(sec % 60)
                 ms = int((sec - int(sec)) * 1000)
                 return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            blocks = []
-            for idx, st, ed, txt in srt_entries:
-                # 長過ぎる行を適宜改行
+            blocks: list[str] = []
+            for idx0, st, ed, txt in srt_entries:
                 if len(txt) > srt_max_line:
-                    lines = [txt[i:i+srt_max_line] for i in range(0, len(txt), srt_max_line)]
+                    lines = [txt[i:i + srt_max_line] for i in range(0, len(txt), srt_max_line)]
                     txt_fmt = '\n'.join(lines)
                 else:
                     txt_fmt = txt
-                blocks.append(f"{idx}\n{to_srt_timestamp(st)} --> {to_srt_timestamp(ed)}\n{txt_fmt}\n")
-            srt_text = '\n'.join(blocks)
-            return {'text': srt_text, 'segments': gui_segments, 'language': 'mixed'}
-        elif output_format == 'jsonl':
+                blocks.append(f"{idx0}\n{to_srt_timestamp(st)} --> {to_srt_timestamp(ed)}\n{txt_fmt}\n")
+            return {
+                'text': '\n'.join(blocks),
+                'segments': gui_segments,
+                'language': 'mixed'
+            }
+        if output_format == 'jsonl':
             import json
-            jsonl_text = '\n'.join(json.dumps(e, ensure_ascii=False) for e in jsonl_entries)
-            return {'text': jsonl_text, 'segments': gui_segments, 'language': 'mixed'}
-        else:
-            return {'text': full_text, 'segments': gui_segments, 'language': 'mixed'}
+            return {
+                'text': '\n'.join(json.dumps(e, ensure_ascii=False) for e in jsonl_entries),
+                'segments': gui_segments,
+                'language': 'mixed'
+            }
+        return {'text': full_text, 'segments': gui_segments, 'language': 'mixed'}
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -316,30 +407,38 @@ def advanced_process_video(
 # ====================================================================================================
 
 class TranscriptionThread(QThread):
+    """GUI から起動されるバックグラウンド文字起こしスレッド。"""
+
     progress = Signal(int)
     status = Signal(str)
     finished_transcription = Signal(dict)
     error = Signal(str)
-    
-    def __init__(self, video_path, options):
+
+    def __init__(self, video_path: str, options: dict):  # options は GUI で構築
         super().__init__()
         self.video_path = video_path
         self.options = options
-        
-    def run(self):
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        """GUI からキャンセル要求。"""
+        self._cancel_requested = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested
+
+    def run(self) -> None:  # QThread 既定 run override
         try:
             self.status.emit("モデルを読み込み中...")
             self.progress.emit(10)
-            # デバイスの設定
-            # 高度処理: advanced_process_video のみ利用
-            adv_result = advanced_process_video(
+            result = advanced_process_video(
                 self.video_path,
                 model_size=self.options.get('model', 'large-v3'),
                 segmentation_model_size=self.options.get('segmentation_model_size', 'turbo'),
                 seg_mode=self.options.get('seg_mode', 'hybrid'),
+                device=self.options.get('device'),
                 ja_weight=self.options.get('ja_weight', 0.80),
                 ru_weight=self.options.get('ru_weight', 1.25),
-                ru_accent_boost=self.options.get('ru_accent_boost', 0.0),
                 min_seg_dur=self.options.get('min_seg_dur', 0.60),
                 ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
                 vad_level=self.options.get('vad_level', 2),
@@ -348,16 +447,17 @@ class TranscriptionThread(QThread):
                 srt_max_line=self.options.get('srt_max_line', 50),
                 include_silent=self.options.get('include_silent', False),
                 debug=self.options.get('debug_segments', False),
-                progress_callback=lambda p: self.progress.emit(p)
+                progress_callback=lambda p: self.progress.emit(p),
+                status_callback=lambda m: self.status.emit(m),
+                cancel_flag=self.is_cancelled,
             )
-            transcription_result = adv_result
             self.progress.emit(100)
-            self.status.emit("文字起こし完了")
-            self.finished_transcription.emit(transcription_result)
-            
-        except Exception as e:
-            # 標準出力へスタックトレース付きでエラー表示
-            print("[ERROR] Transcription thread exception:", e)
-            traceback.print_exc()
+            if self.is_cancelled():
+                self.status.emit("キャンセルされました")
+            else:
+                self.status.emit("文字起こし完了")
+            self.finished_transcription.emit(result)
+        except Exception as e:  # 例外はログ + シグナル
+            logger.exception("[ERROR] Transcription thread exception:")
             self.error.emit(str(e))
             self.status.emit("エラーが発生しました")

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
 )
 from PySide6.QtCore import Qt, QUrl, Slot, QLoggingCategory, QTimer
+import logging
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from transcriber import TranscriptionThread
@@ -568,20 +569,48 @@ class VideoTranscriptionApp(QMainWindow):
         scroll_area.setWidgetResizable(True)
         right_layout.addWidget(scroll_area)
 
-        # 文字起こし実行ボタンとプログレスバー
+        # 文字起こし実行ボタン / プログレス / ステータス / ログ
         transcribe_layout = QVBoxLayout()
-
+        btn_row = QHBoxLayout()
         self.transcribe_button = QPushButton("文字起こしを開始")
         self.transcribe_button.clicked.connect(self.start_transcription)
         self.transcribe_button.setEnabled(False)
-        transcribe_layout.addWidget(self.transcribe_button)
+        btn_row.addWidget(self.transcribe_button)
+        self.cancel_button = QPushButton("キャンセル")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_transcription)
+        btn_row.addWidget(self.cancel_button)
+        transcribe_layout.addLayout(btn_row)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setMinimum(0)
         transcribe_layout.addWidget(self.progress_bar)
 
-        self.status_label = QLabel("")
+        self.status_label = QLabel("待機中")
+        self.status_label.setMinimumHeight(22)
         transcribe_layout.addWidget(self.status_label)
+
+        # 折りたたみ可能ログパネル
+        self.log_panel_container = QWidget()
+        log_layout = QVBoxLayout(self.log_panel_container)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        toggle_row = QHBoxLayout()
+        self.toggle_log_button = QPushButton("▼ ログ表示")
+        self.toggle_log_button.setCheckable(True)
+        self.toggle_log_button.setChecked(False)
+        self.toggle_log_button.toggled.connect(self.toggle_log_panel)
+        toggle_row.addWidget(self.toggle_log_button)
+        toggle_row.addStretch()
+        log_layout.addLayout(toggle_row)
+        from PySide6.QtWidgets import QTextEdit as _QTextEdit
+        self.log_text = _QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setVisible(False)
+        self.log_text.setStyleSheet("QTextEdit { font-family: Consolas, 'Courier New', monospace; font-size:11px; }")
+        log_layout.addWidget(self.log_text)
+        transcribe_layout.addWidget(self.log_panel_container)
 
         right_layout.addLayout(transcribe_layout)
 
@@ -693,21 +722,16 @@ class VideoTranscriptionApp(QMainWindow):
         options["ru_weight"] = self.ru_weight_slider.value() / 100.0
         # アクセント補正 (config の値を使う: GUI 未露出)
         cfg_default = self.config.get("default", {})
-        if "ru_accent_boost" in cfg_default:
-            try:
-                options["ru_accent_boost"] = float(
-                    cfg_default.get("ru_accent_boost", 0.0)
-                )
-            except Exception:
-                options["ru_accent_boost"] = 0.0
+        # ru_accent_boost 廃止: 旧設定があっても無視
         # 互換用 language (未使用だが将来拡張向け)
         if selected_langs:
             options["language"] = selected_langs[0]
 
         # UIを無効化
         self.transcribe_button.setEnabled(False)
-        self.progress_bar.setVisible(True)
+        self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.status_label.setText("モデルを読み込み中...")
 
         # 文字起こしスレッドを開始
         self.transcription_thread = TranscriptionThread(
@@ -728,22 +752,46 @@ class VideoTranscriptionApp(QMainWindow):
     @Slot(str)
     def update_status(self, message):
         self.status_label.setText(message)
+        # ログ履歴に追加
+        if hasattr(self, 'log_text'):
+            self.log_text.append(message)
+            if self.log_text.isVisible():
+                self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
 
     @Slot(dict)
     def on_transcription_finished(self, result):
         self.transcription_result = result
         self.display_transcription(result)
         self.transcribe_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self.cancel_button.setEnabled(False)
+        self.progress_bar.setValue(100)
         self.status_label.setText("文字起こし完了")
 
     @Slot(str)
     def on_transcription_error(self, error_message):
-        # 標準出力にも表示
-        print(f"[ERROR] {error_message}")
+        logger = logging.getLogger(__name__)
+        logger.error(f"Transcription error: {error_message}")
         self.status_label.setText(f"エラー: {error_message}")
         self.transcribe_button.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self.cancel_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+
+    def cancel_transcription(self):
+        if self.transcription_thread and self.transcription_thread.isRunning():
+            self.status_label.setText("キャンセル要求送信中...")
+            try:
+                self.transcription_thread.request_cancel()
+                self.cancel_button.setEnabled(False)
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Cancel failed: {e}")
+
+    def toggle_log_panel(self, checked: bool):
+        if checked:
+            self.log_text.setVisible(True)
+            self.toggle_log_button.setText("▲ ログ非表示")
+        else:
+            self.log_text.setVisible(False)
+            self.toggle_log_button.setText("▼ ログ表示")
 
     def display_transcription(self, result):
         # テーブルをクリア
@@ -829,6 +877,14 @@ class VideoTranscriptionApp(QMainWindow):
 
 
 def main():
+    # ベーシックロギング設定 (transcriber 側で既にハンドラがあれば二重追加は避けられる)
+    logger = logging.getLogger()
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter('[%(levelname)s] %(asctime)s %(name)s: %(message)s', '%H:%M:%S'))
+        logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+
     app = QApplication(sys.argv)
     window = VideoTranscriptionApp()
     window.show()

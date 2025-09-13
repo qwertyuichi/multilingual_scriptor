@@ -26,5 +26,5 @@ initial_prompt = "風見カプラ Всем Привет Казами Капра"
 device = "cuda"
 # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
 default_languages = ["ja", "ru"]
-# ru_accent_boost: 日本語訛りで RU が JA に負けやすいとき RU 確率へ最終的に加算するパーセンテージ (0.0 で無効)
-ru_accent_boost = 0.0
+## (廃止) ru_accent_boost: 過去バージョンで RU 判定を後付け加算するためのパラメータでしたが
+## 役割が ru_weight と重複し挙動が不明瞭になるため削除しました。
