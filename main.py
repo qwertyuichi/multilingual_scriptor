@@ -57,6 +57,37 @@ QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg=false")
 
 
 class VideoTranscriptionApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("動画文字起こしエディタ")
+        # 基本フィールド初期化
+        self.media_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.media_player.setAudioOutput(self.audio_output)
+        self.transcription_thread = None
+        self.current_video_path = None
+        self.transcription_result = None
+
+        # 設定ロード
+        try:
+            self.config = self.load_config()
+        except Exception as e:
+            # 最低限のフォールバック設定
+            logging.getLogger(__name__).error(f"設定ロード失敗: {e}")
+            self.config = {"default": {}}
+
+        # UI 初期化とシグナル接続
+        self.init_ui()
+        self.connect_signals()
+        # テーブル行クリックで動画シーク
+        self.transcription_table.cellClicked.connect(self.seek_to_table_row)
+
+        # 初期ウィンドウサイズと位置（最小サイズ設定でレイアウト崩れ防止）
+        self.setMinimumSize(800, 600)
+        self.resize(1600, 800)
+        # 画面左上へ移動 (0,0)
+        self.move(0, 0)
+
     def seek_to_table_row(self, row, col):
         # START列の値を取得し、hh:mm:ss→秒に変換してシーク
         start_item = self.transcription_table.item(row, 0)
@@ -92,38 +123,8 @@ class VideoTranscriptionApp(QMainWindow):
         if row_to_select is not None:
             self.transcription_table.setCurrentCell(row_to_select, 0)
             self.transcription_table.scrollToItem(
-                self.transcription_table.item(row_to_select, 0),
-                QTableWidget.PositionAtCenter,
+                self.transcription_table.item(row_to_select, 0)
             )
-
-    def __init__(self):
-        super().__init__()
-        # 設定読み込み
-        self.config = self.load_config()
-        self.setWindowTitle("動画文字起こしエディタ")
-        self.setGeometry(0, 0, 1400, 800)
-
-        # メディアプレイヤーの初期化
-        self.media_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.media_player.setAudioOutput(self.audio_output)
-
-        # 文字起こしスレッド
-        self.transcription_thread = None
-        self.current_video_path = None
-        self.transcription_result = None
-
-        # UIの初期化
-        self.init_ui()
-
-        # シグナルの接続
-        self.connect_signals()
-        # テーブル行クリックで動画シーク
-        self.transcription_table.cellClicked.connect(self.seek_to_table_row)
-        # 再生位置変化で表の行選択・自動スクロール
-        self.media_player.positionChanged.connect(
-            self.sync_table_selection_with_position
-        )
 
     def load_config(self):
         """config.toml を読み込み。無ければエラーを送出。フォールバック挿入は行わない。"""
@@ -152,18 +153,13 @@ class VideoTranscriptionApp(QMainWindow):
             "デバイス": (
                 "Whisper を実行する計算デバイス。\n"
                 "cuda: GPU 使用 (推奨 / 速度向上)\ncpu: CPU フォールバック (低速)\n"
-                "・CUDA が利用不可の場合は自動的に cpu のみ選択可\n"
-                "・マシンに複数 GPU がある場合の個別指定は今後拡張余地"
+                "・CUDA が利用不可の場合は自動的に cpu のみ選択可"
             ),
             "トランスクリプションモデル": (
                 "音声→文字変換に使用する Whisper モデルサイズ。\n"
-                "小さなモデル: 高速 / 低精度・短文向き\n大きなモデル: 低速 / 高精度・多言語安定\n"
-                "・large-v3 推奨 (精度バランス)\n・低スペック環境: base / small で試行"
             ),
             "セグメンテーションモデル": (
-                "音声区間の切り出し(セグメント化)に用いるモデル。\n"
-                "turbo: 高速 (精度より速度優先)\nlarge 系: 精度は高いが遅い\n"
-                "・実際の文字起こしモデルとは別個にロード\n・精度が不要に低い場合のみサイズ拡大を検討"
+                "音声区間の切り出し(セグメント化)に用いるモデル。"
             ),
             "ja_weight": (
                 "日本語言語判定スコアへの補正係数。\n"
@@ -294,7 +290,15 @@ class VideoTranscriptionApp(QMainWindow):
 
         left_layout.addLayout(control_layout)
 
-        # 文字起こし結果表示エリア（テーブル化）
+        # テーブル直前の右寄せエクスポートバー
+        export_bar = QHBoxLayout()
+        export_bar.addStretch()
+        self.export_button = QPushButton("書き出し...")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_transcription)
+        export_bar.addWidget(self.export_button)
+        left_layout.addLayout(export_bar)
+
         self.transcription_table = QTableWidget()
         # テーブル選択行の強調（青背景＋白文字）
         table_style = """
@@ -307,20 +311,18 @@ class VideoTranscriptionApp(QMainWindow):
         }
         """
         self.transcription_table.setStyleSheet(table_style)
-        self.transcription_table = QTableWidget()
-        self.transcription_table.setStyleSheet(table_style)
         self.transcription_table.setColumnCount(5)
         self.transcription_table.setHorizontalHeaderLabels(
-            ["START", "END", "JA", "RU", "TEXT"]
+            ["START", "END", "JA%", "RU%", "TEXT"]
         )
         self.transcription_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.transcription_table.setSelectionBehavior(QTableWidget.SelectRows)
         # 列幅・比率調整
         self.transcription_table.setColumnWidth(0, 80)  # START
         self.transcription_table.setColumnWidth(1, 80)  # END
-        self.transcription_table.setColumnWidth(2, 80)  # JA
-        self.transcription_table.setColumnWidth(3, 80)  # RU
-        self.transcription_table.setColumnWidth(4, 600)  # TEXT
+        self.transcription_table.setColumnWidth(2, 70)  # JA%
+        self.transcription_table.setColumnWidth(3, 70)  # RU%
+        self.transcription_table.setColumnWidth(4, 660)  # TEXT
         # ヘッダー中央揃え
         header = self.transcription_table.horizontalHeader()
         for i in range(5):
@@ -474,6 +476,10 @@ class VideoTranscriptionApp(QMainWindow):
             "default_languages",
             "ja_weight",
             "ru_weight",
+            # GUI から除去: 旧オプション (backend で固定挙動化済)
+            "dual_transcribe_all",
+            "merge_refine",
+            "enable_temp_fallback",
         }
 
         # キー毎に適切なウィジェットを生成
@@ -605,10 +611,13 @@ class VideoTranscriptionApp(QMainWindow):
         toggle_row.addStretch()
         log_layout.addLayout(toggle_row)
         from PySide6.QtWidgets import QTextEdit as _QTextEdit
+
         self.log_text = _QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setVisible(False)
-        self.log_text.setStyleSheet("QTextEdit { font-family: Consolas, 'Courier New', monospace; font-size:11px; }")
+        self.log_text.setStyleSheet(
+            "QTextEdit { font-family: Consolas, 'Courier New', monospace; font-size:11px; }"
+        )
         log_layout.addWidget(self.log_text)
         transcribe_layout.addWidget(self.log_panel_container)
 
@@ -730,6 +739,7 @@ class VideoTranscriptionApp(QMainWindow):
         # UIを無効化
         self.transcribe_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
+        self.export_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.status_label.setText("モデルを読み込み中...")
 
@@ -753,10 +763,12 @@ class VideoTranscriptionApp(QMainWindow):
     def update_status(self, message):
         self.status_label.setText(message)
         # ログ履歴に追加
-        if hasattr(self, 'log_text'):
+        if hasattr(self, "log_text"):
             self.log_text.append(message)
             if self.log_text.isVisible():
-                self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+                self.log_text.verticalScrollBar().setValue(
+                    self.log_text.verticalScrollBar().maximum()
+                )
 
     @Slot(dict)
     def on_transcription_finished(self, result):
@@ -764,6 +776,7 @@ class VideoTranscriptionApp(QMainWindow):
         self.display_transcription(result)
         self.transcribe_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self.export_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.status_label.setText("文字起こし完了")
 
@@ -774,6 +787,7 @@ class VideoTranscriptionApp(QMainWindow):
         self.status_label.setText(f"エラー: {error_message}")
         self.transcribe_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self.export_button.setEnabled(bool(getattr(self, 'transcription_result', None)))
         self.progress_bar.setValue(0)
 
     def cancel_transcription(self):
@@ -794,48 +808,172 @@ class VideoTranscriptionApp(QMainWindow):
             self.toggle_log_button.setText("▼ ログ表示")
 
     def display_transcription(self, result):
-        # テーブルをクリア
         self.transcription_table.setRowCount(0)
         segments = result.get("segments", [])
-        # transcriber 側で各セグメントに確率情報が含まれている場合はそれを使う
-        # なければ EN=0.0, JA/RU=空欄
         for seg in segments:
             row = self.transcription_table.rowCount()
             self.transcription_table.insertRow(row)
-            # START, END (hh:mm:ss)
             start_sec = seg.get("start", 0.0)
             end_sec = seg.get("end", 0.0)
-
             def to_hms(sec):
                 h = int(sec // 3600)
                 m = int((sec % 3600) // 60)
                 s = int(sec % 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
-
             start_str = to_hms(start_sec)
             end_str = to_hms(end_sec)
-            # JA, RU 確率
-            ja = seg.get("ja_prob", "")
-            ru = seg.get("ru_prob", "")
-            text = seg.get("text", "")
-            ja_str = f"{ja:.2f}%" if isinstance(ja, (int, float)) else str(ja)
-            ru_str = f"{ru:.2f}%" if isinstance(ru, (int, float)) else str(ru)
-            # セル生成
-            items = [
-                QTableWidgetItem(str(start_str)),
-                QTableWidgetItem(str(end_str)),
-                QTableWidgetItem(ja_str),
-                QTableWidgetItem(ru_str),
-                QTableWidgetItem(text),
-            ]
-            # START,END,JA,RUは中央揃え
-            for i in range(4):
-                items[i].setTextAlignment(Qt.AlignCenter)
-            self.transcription_table.setItem(row, 0, items[0])
-            self.transcription_table.setItem(row, 1, items[1])
-            self.transcription_table.setItem(row, 2, items[2])
-            self.transcription_table.setItem(row, 3, items[3])
-            self.transcription_table.setItem(row, 4, items[4])
+            if seg.get('gap'):
+                # GAP 行: JA/RU% を空欄にし TEXT に [GAP] を表示
+                start_item = QTableWidgetItem(start_str)
+                end_item = QTableWidgetItem(end_str)
+                ja_item = QTableWidgetItem("")
+                ru_item = QTableWidgetItem("")
+                text_item = QTableWidgetItem("[GAP]")
+                from PySide6.QtGui import QColor
+                # 視覚的に区別 (グレー)
+                gap_color = QColor(120,120,120)
+                text_item.setForeground(gap_color)
+                for it in (start_item, end_item, ja_item, ru_item):
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setForeground(gap_color)
+                self.transcription_table.setItem(row, 0, start_item)
+                self.transcription_table.setItem(row, 1, end_item)
+                self.transcription_table.setItem(row, 2, ja_item)
+                self.transcription_table.setItem(row, 3, ru_item)
+                self.transcription_table.setItem(row, 4, text_item)
+                continue
+            ja_prob = seg.get("ja_prob", 0.0)
+            ru_prob = seg.get("ru_prob", 0.0)
+            text_ja = seg.get("text_ja", "")
+            text_ru = seg.get("text_ru", "")
+            display_text = text_ja if ja_prob >= ru_prob else text_ru
+            start_item = QTableWidgetItem(start_str)
+            end_item = QTableWidgetItem(end_str)
+            ja_item = QTableWidgetItem(f"{ja_prob:.2f}")
+            ru_item = QTableWidgetItem(f"{ru_prob:.2f}")
+            text_item = QTableWidgetItem(display_text)
+            for it in (start_item, end_item, ja_item, ru_item):
+                it.setTextAlignment(Qt.AlignCenter)
+            from PySide6.QtGui import QColor
+            if ja_prob >= ru_prob:
+                ja_item.setForeground(QColor(200,0,0))
+                ru_item.setForeground(QColor(0,0,180))
+            else:
+                ru_item.setForeground(QColor(200,0,0))
+                ja_item.setForeground(QColor(0,0,180))
+            self.transcription_table.setItem(row, 0, start_item)
+            self.transcription_table.setItem(row, 1, end_item)
+            self.transcription_table.setItem(row, 2, ja_item)
+            self.transcription_table.setItem(row, 3, ru_item)
+            self.transcription_table.setItem(row, 4, text_item)
+
+    def export_transcription(self):
+        """認識結果をファイルに書き出す (txt / srt / jsonl)。"""
+        if not getattr(self, 'transcription_result', None):
+            self.status_label.setText("書き出し対象がありません")
+            return
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        # デフォルトファイル名: 動画ファイル名 (拡張子除去) + .txt
+        if self.current_video_path:
+            base = os.path.splitext(os.path.basename(self.current_video_path))[0]
+            default_name = f"{base}.txt"
+        else:
+            default_name = "transcription.txt"
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "書き出しファイルを保存",
+            default_name,
+            "テキスト (*.txt);;SRT 字幕 (*.srt);;JSON Lines (*.jsonl)"
+        )
+        if not file_path:
+            return
+        if selected_filter.startswith("SRT") or file_path.lower().endswith('.srt'):
+            fmt = 'srt'
+        elif selected_filter.startswith("JSON") or file_path.lower().endswith('.jsonl'):
+            fmt = 'jsonl'
+        else:
+            fmt = 'txt'
+        try:
+            text = self._build_export_text(fmt)
+            if fmt == 'txt' and not file_path.lower().endswith('.txt'):
+                file_path += '.txt'
+            elif fmt == 'srt' and not file_path.lower().endswith('.srt'):
+                file_path += '.srt'
+            elif fmt == 'jsonl' and not file_path.lower().endswith('.jsonl'):
+                file_path += '.jsonl'
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            self.status_label.setText(f"書き出し完了: {file_path}")
+        except Exception as e:
+            logging.getLogger(__name__).exception("Export failed")
+            QMessageBox.critical(self, "書き出しエラー", str(e))
+            self.status_label.setText("書き出し失敗")
+
+    def _build_export_text(self, fmt: str) -> str:
+        result = self.transcription_result
+        if fmt == 'txt':
+            return result.get('text', '')
+        segments = result.get('segments', [])
+        if fmt == 'srt':
+            def to_srt_timestamp(sec: float) -> str:
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                s = int(sec % 60)
+                ms = int((sec - int(sec)) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            lines = []
+            n = 1
+            for seg in segments:
+                if seg.get('gap'):
+                    continue
+                start = float(seg.get('start', 0.0))
+                end = float(seg.get('end', 0.0))
+                ja_prob = seg.get('ja_prob', 0.0)
+                ru_prob = seg.get('ru_prob', 0.0)
+                text_ja = seg.get('text_ja', '')
+                text_ru = seg.get('text_ru', '')
+                txt = text_ja if ja_prob >= ru_prob else text_ru
+                if not txt:
+                    continue
+                lines.append(f"{n}\n{to_srt_timestamp(start)} --> {to_srt_timestamp(end)}\n{txt}\n")
+                n += 1
+            return '\n'.join(lines)
+        if fmt == 'jsonl':
+            import json
+            rows = []
+            idx = 1
+            for seg in segments:
+                if seg.get('gap'):
+                    rows.append(json.dumps({
+                        'index': idx,
+                        'start': seg.get('start', 0.0),
+                        'end': seg.get('end', 0.0),
+                        'text': '[GAP]',
+                        'ja_prob': 0.0,
+                        'ru_prob': 0.0,
+                        'gap': True
+                    }, ensure_ascii=False))
+                    idx += 1
+                    continue
+                ja_prob = seg.get('ja_prob', 0.0)
+                ru_prob = seg.get('ru_prob', 0.0)
+                text_ja = seg.get('text_ja', '')
+                text_ru = seg.get('text_ru', '')
+                main_text = text_ja if ja_prob >= ru_prob else text_ru
+                rows.append(json.dumps({
+                    'index': idx,
+                    'start': seg.get('start', 0.0),
+                    'end': seg.get('end', 0.0),
+                    'text': main_text,
+                    'ja_prob': ja_prob,
+                    'ru_prob': ru_prob,
+                    'text_ja': text_ja,
+                    'text_ru': text_ru,
+                    'gap': False
+                }, ensure_ascii=False))
+                idx += 1
+            return '\n'.join(rows)
+        raise ValueError(f"未知の出力形式: {fmt}")
 
     def play_pause(self):
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:
@@ -881,7 +1019,11 @@ def main():
     logger = logging.getLogger()
     if not logger.handlers:
         h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter('[%(levelname)s] %(asctime)s %(name)s: %(message)s', '%H:%M:%S'))
+        h.setFormatter(
+            logging.Formatter(
+                "[%(levelname)s] %(asctime)s %(name)s: %(message)s", "%H:%M:%S"
+            )
+        )
         logger.addHandler(h)
     logger.setLevel(logging.INFO)
 

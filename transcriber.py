@@ -291,7 +291,21 @@ def advanced_process_video(
             st = seg['start']; ed = seg['end']  # 秒
             gap = st - prev_end
             if include_silent and gap >= gap_threshold and prev_end>0:
+                # テキスト出力用 GAP 行
                 output_lines.append(f"[GAP {gap:.2f}s]")
+                # GUI 表示用 GAP 疑似セグメント (音声無し区間)
+                gui_segments.append({
+                    'start': prev_end,
+                    'end': st,
+                    'text': '[GAP]',
+                    'text_ja': '',
+                    'text_ru': '',
+                    'chosen_language': 'gap',
+                    'id': f"gap-{idx}",  # 音声セグメントとは別扱い
+                    'ja_prob': 0.0,
+                    'ru_prob': 0.0,
+                    'gap': True,
+                })
             prev_end = ed
             start_sample = max(0, int(st * 16000))
             end_sample = min(len(full_audio), int(ed * 16000))
@@ -310,37 +324,25 @@ def advanced_process_video(
             if not isinstance(clip, np.ndarray) or clip.ndim != 1 or clip.size == 0:
                 logger.debug(f"[SKIP] invalid clip shape: {clip.shape}")
                 continue
+            # 強制デュアル: 常に JA/RU 両方文字起こしし、_detect_lang_probs の確率を基準に主表示を選択
             detected_lang, ja_prob, ru_prob = _detect_lang_probs(
                 model, clip, ja_weight, ru_weight
             )
-            amb = abs(ja_prob - ru_prob) < ambiguous_threshold
-            if amb:  # あいまい時は JA/RU 両方再トライ
-                ja_res = _transcribe_clip(model, clip, 'ja')
-                ru_res = _transcribe_clip(model, clip, 'ru')
-                def safe_avg_logprob(res):
-                    segs = res.get('segments') or []
-                    if len(segs) == 0:
-                        return -9999.0
-                    return segs[0].get('avg_logprob', -9999.0)
-                ja_score = safe_avg_logprob(ja_res)
-                ru_score = safe_avg_logprob(ru_res)
-                ja_text = ja_res.get('text', '').strip(); ru_text = ru_res.get('text', '').strip()
-                if ja_score == ru_score:
-                    if len(ja_text) >= len(ru_text):
-                        detected_lang, seg_text = 'ja', ja_text
-                    else:
-                        detected_lang, seg_text = 'ru', ru_text
-                elif ja_score > ru_score:
-                    detected_lang, seg_text = 'ja', ja_text
-                else:
-                    detected_lang, seg_text = 'ru', ru_text
+            ja_res = _transcribe_clip(model, clip, 'ja')
+            ru_res = _transcribe_clip(model, clip, 'ru')
+            ja_text_raw = ja_res.get('text', '').strip()
+            ru_text_raw = ru_res.get('text', '').strip()
+            ja_text = clean_hallucination(ja_text_raw)
+            ru_text = clean_hallucination(ru_text_raw)
+            # 確率の高い方を main text とする
+            if ja_prob >= ru_prob:
+                seg_text = ja_text
+                chosen_lang = 'ja'
             else:
-                seg_res = _transcribe_clip(model, clip, detected_lang)
-                seg_text = seg_res.get('text','').strip()
-            if not seg_text:
+                seg_text = ru_text
+                chosen_lang = 'ru'
+            if not (ja_text or ru_text):
                 continue
-            seg_text = clean_hallucination(seg_text)
-            # [MIX]機能削除
             def fmt_ts(t: float) -> str:
                 td = timedelta(seconds=t)
                 total_seconds = td.total_seconds()
@@ -349,11 +351,22 @@ def advanced_process_video(
                 s = total_seconds % 60
                 return f"{h:02d}:{m:02d}:{s:06.3f}"
             ts_start, ts_end = fmt_ts(st), fmt_ts(ed)
-            line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] {seg_text}".strip()
+            line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] JA={ja_text} | RU={ru_text}".strip()
             output_lines.append(line)
-            gui_segments.append({'start': st, 'end': ed, 'text': seg_text, 'id': idx, 'ja_prob': ja_prob, 'ru_prob': ru_prob})
+            gui_segments.append({
+                'start': st,
+                'end': ed,
+                'text': seg_text,
+                'text_ja': ja_text,
+                'text_ru': ru_text,
+                'chosen_language': chosen_lang,
+                'id': idx,
+                'ja_prob': ja_prob,
+                'ru_prob': ru_prob
+            })
             # SRT/JSONL用
             srt_entries.append((idx+1, st, ed, seg_text))
+            amb = abs(ja_prob - ru_prob) < ambiguous_threshold
             jsonl_entries.append({
                 'index': idx+1,
                 'start': st,
