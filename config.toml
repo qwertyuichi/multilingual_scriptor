@@ -5,12 +5,9 @@ transcription_model = "large-v3"
 segmentation_model = "turbo"
 # min_seg_dur: 1セグメントの最小継続時間(秒)
 min_seg_dur = 0.60
-# ja_weight / ru_weight / en_weight: 言語判定スコアに掛ける重み補正
-ja_weight = 0.80
+# ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
+ja_weight = 1.00
 ru_weight = 1.00
-en_weight = 1.00
-# mix_threshold: JA/RU スコア差がこの値未満なら [MIX] を付与
-mix_threshold = 6.0
 # output_format: 出力形式候補 "txt" / "srt" / "json"
 output_format = "txt"
 # srt_max_line: SRT 化する際の最大行数目安
@@ -22,10 +19,12 @@ vad_level = 2
 # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
 gap_threshold = 0.5
 # include_silent: スキップ/無音情報を出力へ含めるか
-include_silent = false
+include_silent = true
 # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
-initial_prompt = ""
+initial_prompt = "風見カプラ Всем Привет Казами Капра"
 # device: 使用するデバイス (cpu / cuda)
 device = "cuda"
 # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
 default_languages = ["ja", "ru"]
+# ru_accent_boost: 日本語訛りで RU が JA に負けやすいとき RU 確率へ最終的に加算するパーセンテージ (0.0 で無効)
+ru_accent_boost = 0.0

@@ -1,3 +1,22 @@
+def clean_hallucination(text: str, max_repeat: int = 8) -> str:
+    """1文字が極端に繰り返されている場合縮約。連続30文字以上の同種があれば警告タグ。"""
+    cleaned = []
+    prev = ''
+    count = 0
+    for ch in text:
+        if ch == prev:
+            count += 1
+            if count <= max_repeat:
+                cleaned.append(ch)
+        else:
+            prev = ch
+            count = 1
+            cleaned.append(ch)
+    out = ''.join(cleaned)
+    # 連続で30文字以上の同種(句読点/同字)があれば警告タグ
+    if any(len(block) >= 30 for block in out.split()):
+        out = '[HALLUCINATION?] ' + out[:120]
+    return out
 import whisper
 import torch
 from PySide6.QtCore import QThread, Signal
@@ -10,6 +29,7 @@ import numpy as np
 from scipy.io import wavfile
 import webrtcvad
 from datetime import timedelta
+import traceback
 
 # =============== 高度処理用ユーティリティ (reference/transcription_for_kapra.py から抽出/簡略化) ===============
 
@@ -56,28 +76,73 @@ def _has_voice(segment: np.ndarray, sample_rate: int = 16000, vad_level: int = 2
             return True
     return False
 
-def _detect_lang_probs(model, audio_segment, ja_weight=1.0, ru_weight=1.0, en_weight=1.0):
+def _detect_lang_probs(model, audio_segment, ja_weight=1.0, ru_weight=1.0, ru_accent_boost: float = 0.0):
+    """JA/RU の言語確率のみを取得し、重み補正後に返す。ENは無視。"""
+    # reference版と同じpad/trimming・例外時pad再試行方式
+    sr = 16000
+    min_len = sr * 2
+    max_len = sr * 30
     if isinstance(audio_segment, torch.Tensor):
         audio_segment = audio_segment.detach().cpu().numpy()
     audio_segment = np.asarray(audio_segment).flatten().astype(np.float32)
-    sr = 16000
-    if len(audio_segment) < sr*2:
-        audio_segment = whisper.pad_or_trim(audio_segment, sr*2)
-    elif len(audio_segment) > sr*30:
-        audio_segment = whisper.pad_or_trim(audio_segment, sr*30)
-    mel = whisper.log_mel_spectrogram(audio_segment).to(model.device)
+    length = len(audio_segment)
+    if length < min_len:
+        audio_segment = whisper.pad_or_trim(audio_segment, min_len)
+    elif length > max_len:
+        audio_segment = whisper.pad_or_trim(audio_segment, max_len)
+    # モデルが期待するメルバンド数を動的取得
+    try:
+        if hasattr(model, 'dims') and hasattr(model.dims, 'n_mels'):
+            expected_mels = model.dims.n_mels
+        else:
+            expected_mels = model.encoder.conv1.weight.shape[1]
+        if not isinstance(expected_mels, int):
+            expected_mels = 80
+    except Exception:
+        expected_mels = 80
+    # 期待メル数に合わせて計算
+    try:
+        mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
+    except TypeError:
+        mel = whisper.log_mel_spectrogram(audio_segment).to(model.device)
+    except AssertionError:
+        audio_segment = np.asarray(audio_segment).flatten().astype(np.float32)
+        mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
+    if mel.shape[0] not in (expected_mels, 80):
+        try:
+            mel = whisper.log_mel_spectrogram(audio_segment, n_mels=expected_mels).to(model.device)
+        except Exception:
+            pass
+    # 言語検出
     try:
         with torch.no_grad():
             _, probs = model.detect_language(mel)
-    except Exception:
-        probs = {'ja':0.5,'ru':0.5,'en':0.5}
-    ja_prob = probs.get('ja',0.0)*100; ru_prob = probs.get('ru',0.0)*100; en_prob = probs.get('en',0.0)*100
-    if ja_weight!=1.0 or ru_weight!=1.0 or en_weight!=1.0:
-        ja_adj=(ja_prob/100)*ja_weight; ru_adj=(ru_prob/100)*ru_weight; en_adj=(en_prob/100)*en_weight; denom=ja_adj+ru_adj+en_adj
-        if denom>0:
-            ja_prob=ja_adj/denom*100; ru_prob=ru_adj/denom*100; en_prob=en_adj/denom*100
-    detected_lang = 'ja' if ja_prob >= ru_prob and ja_prob >= en_prob else 'ru' if ru_prob >= en_prob else 'en'
-    return detected_lang, ja_prob, ru_prob, en_prob
+        print(f"[LANG_PROB] probs={probs}")
+    except Exception as e:
+        # フォールバック: 30秒pad + mel再試行
+        try:
+            padded = whisper.pad_or_trim(audio_segment, sr * 30)
+            mel2 = whisper.log_mel_spectrogram(padded, n_mels=expected_mels).to(model.device)
+            with torch.no_grad():
+                _, probs = model.detect_language(mel2)
+        except Exception:
+            print(f"[LANG_PROB][EXCEPTION] {e}. fallback probs={{'ja':0.5,'ru':0.5}}")
+            probs = {'ja':0.5,'ru':0.5}
+    ja_raw = float(probs.get('ja',0.0))
+    ru_raw = float(probs.get('ru',0.0))
+    # 重み補正 (正規化)
+    ja_adj = ja_raw * ja_weight
+    ru_adj = ru_raw * ru_weight
+    denom = ja_adj + ru_adj
+    if denom > 0:
+        ja_prob = ja_adj / denom * 100.0
+        ru_prob = ru_adj / denom * 100.0
+    else:
+        ja_prob = ru_prob = 50.0
+    if ru_accent_boost > 0 and ru_prob < ja_prob:
+        ru_prob = min(100.0, ru_prob + ru_accent_boost)
+    detected_lang = 'ja' if ja_prob >= ru_prob else 'ru'
+    return detected_lang, ja_prob, ru_prob
 
 def _transcribe_clip(model, audio_segment, language):
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
@@ -99,16 +164,16 @@ def advanced_process_video(
         seg_mode: str = 'hybrid',
         ja_weight: float = 0.80,
         ru_weight: float = 1.25,
-        en_weight: float = 1.00,
+        ru_accent_boost: float = 0.0,
         min_seg_dur: float = 0.60,
         ambiguous_threshold: float = 10.0,
-        mix_threshold: float = 6.0,
         vad_level: int = 2,
         gap_threshold: float = 0.5,
         output_format: str = 'txt',
         srt_max_line: int = 50,
         include_silent: bool = False,
         debug: bool = False,
+        progress_callback=None,
     ) -> dict:
     """動画を高度ルールで処理し GUI 互換の結果 dict を返す。
     戻り値: {'text': str, 'segments': [{'start','end','text','id'}], 'language': 'mixed'}
@@ -134,9 +199,15 @@ def advanced_process_video(
             initial_segments = [{'start': s['start'], 'end': s['end']} for s in res.get('segments', [])]
         output_lines = []
         gui_segments = []
+        srt_entries = []
+        jsonl_entries = []
         prev_end = 0.0
         idx = 0
         for seg in initial_segments:
+            # 進捗を10%→90%で細かくemit
+            if progress_callback is not None:
+                prog = 10 + int(80 * (idx + 1) / len(initial_segments)) if len(initial_segments) > 0 else 10
+                progress_callback(prog)
             st = seg['start']; ed = seg['end']
             gap = st - prev_end
             if include_silent and gap >= gap_threshold and prev_end>0:
@@ -152,30 +223,92 @@ def advanced_process_video(
             if not _has_voice(clip, vad_level=vad_level):
                 if include_silent: output_lines.append(f"[SKIP silence {st:.2f}-{ed:.2f}]")
                 continue
-            detected_lang, ja_prob, ru_prob, en_prob = _detect_lang_probs(model, clip, ja_weight, ru_weight, en_weight)
+            # クリップshapeチェック・値確認（リサンプリングは行わずpad/trimmingのみ）
+            if not isinstance(clip, np.ndarray) or clip.ndim != 1 or clip.size == 0:
+                print(f"[SKIP] invalid clip shape: {clip.shape}")
+                continue
+            detected_lang, ja_prob, ru_prob = _detect_lang_probs(
+                model, clip, ja_weight, ru_weight, ru_accent_boost=ru_accent_boost
+            )
             amb = abs(ja_prob - ru_prob) < ambiguous_threshold
             if amb:
                 ja_res = _transcribe_clip(model, clip, 'ja')
                 ru_res = _transcribe_clip(model, clip, 'ru')
-                # choose longer text if tie
+                def safe_avg_logprob(res):
+                    segs = res.get('segments') or []
+                    if len(segs) == 0:
+                        return -9999.0
+                    return segs[0].get('avg_logprob', -9999.0)
+                ja_score = safe_avg_logprob(ja_res)
+                ru_score = safe_avg_logprob(ru_res)
                 ja_text = ja_res.get('text','').strip(); ru_text = ru_res.get('text','').strip()
-                if len(ja_text) >= len(ru_text):
-                    chosen = ('ja', ja_text)
+                if ja_score == ru_score:
+                    if len(ja_text) >= len(ru_text):
+                        detected_lang, seg_text = 'ja', ja_text
+                    else:
+                        detected_lang, seg_text = 'ru', ru_text
+                elif ja_score > ru_score:
+                    detected_lang, seg_text = 'ja', ja_text
                 else:
-                    chosen = ('ru', ru_text)
-                detected_lang = chosen[0]; seg_text = chosen[1]
+                    detected_lang, seg_text = 'ru', ru_text
             else:
                 seg_res = _transcribe_clip(model, clip, detected_lang)
                 seg_text = seg_res.get('text','').strip()
             if not seg_text:
                 continue
-            mix_tag = '[MIX]' if abs(ja_prob - ru_prob) < mix_threshold else ''
-            line = f"[{st:07.2f}->{ed:07.2f}] [JA:{ja_prob:05.2f}% RU:{ru_prob:05.2f}%]{' [AMB]' if amb else ''} {mix_tag} {seg_text}".strip()
+            seg_text = clean_hallucination(seg_text)
+            # [MIX]機能削除
+            def fmt_ts(t: float):
+                td = timedelta(seconds=t)
+                total_seconds = td.total_seconds()
+                h = int(total_seconds // 3600)
+                m = int((total_seconds % 3600) // 60)
+                s = total_seconds % 60
+                return f"{h:02d}:{m:02d}:{s:06.3f}"
+            ts_start = fmt_ts(st)
+            ts_end = fmt_ts(ed)
+            line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] {seg_text}".strip()
             output_lines.append(line)
-            gui_segments.append({'start': st, 'end': ed, 'text': seg_text, 'id': idx})
+            gui_segments.append({'start': st, 'end': ed, 'text': seg_text, 'id': idx, 'ja_prob': ja_prob, 'ru_prob': ru_prob})
+            # SRT/JSONL用
+            srt_entries.append((idx+1, st, ed, seg_text))
+            jsonl_entries.append({
+                'index': idx+1,
+                'start': st,
+                'end': ed,
+                'text': seg_text,
+                'ja_prob': ja_prob,
+                'ru_prob': ru_prob,
+                'ambiguous': amb,
+                'language': detected_lang
+            })
             idx += 1
         full_text = '\n'.join(output_lines)
-        return {'text': full_text, 'segments': gui_segments, 'language': 'mixed'}
+        # SRT/JSONL出力対応
+        if output_format == 'srt':
+            def to_srt_timestamp(sec: float):
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                s = int(sec % 60)
+                ms = int((sec - int(sec)) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            blocks = []
+            for idx, st, ed, txt in srt_entries:
+                # 長過ぎる行を適宜改行
+                if len(txt) > srt_max_line:
+                    lines = [txt[i:i+srt_max_line] for i in range(0, len(txt), srt_max_line)]
+                    txt_fmt = '\n'.join(lines)
+                else:
+                    txt_fmt = txt
+                blocks.append(f"{idx}\n{to_srt_timestamp(st)} --> {to_srt_timestamp(ed)}\n{txt_fmt}\n")
+            srt_text = '\n'.join(blocks)
+            return {'text': srt_text, 'segments': gui_segments, 'language': 'mixed'}
+        elif output_format == 'jsonl':
+            import json
+            jsonl_text = '\n'.join(json.dumps(e, ensure_ascii=False) for e in jsonl_entries)
+            return {'text': jsonl_text, 'segments': gui_segments, 'language': 'mixed'}
+        else:
+            return {'text': full_text, 'segments': gui_segments, 'language': 'mixed'}
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -195,86 +328,36 @@ class TranscriptionThread(QThread):
         
     def run(self):
         try:
-            advanced = self.options.get('advanced', False)
-            if advanced:
-                self.status.emit("高度モード: モデル読み込み中...")
-            else:
-                self.status.emit("モデルを読み込み中...")
+            self.status.emit("モデルを読み込み中...")
             self.progress.emit(10)
-            
             # デバイスの設定
-            device = self.options.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-            
-            if advanced:
-                # 高度処理: advanced_process_video を利用
-                adv_result = advanced_process_video(
-                    self.video_path,
-                    model_size=self.options.get('model', 'large-v3'),
-                    segmentation_model_size=self.options.get('segmentation_model_size', 'turbo'),
-                    seg_mode=self.options.get('seg_mode', 'hybrid'),
-                    ja_weight=self.options.get('ja_weight', 0.80),
-                    ru_weight=self.options.get('ru_weight', 1.25),
-                    en_weight=self.options.get('en_weight', 1.00),
-                    min_seg_dur=self.options.get('min_seg_dur', 0.60),
-                    ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
-                    mix_threshold=self.options.get('mix_threshold', 6.0),
-                    vad_level=self.options.get('vad_level', 2),
-                    gap_threshold=self.options.get('gap_threshold', 0.5),
-                    output_format=self.options.get('output_format', 'txt'),
-                    srt_max_line=self.options.get('srt_max_line', 50),
-                    include_silent=self.options.get('include_silent', False),
-                    debug=self.options.get('debug_segments', False)
-                )
-                transcription_result = adv_result
-                self.progress.emit(100)
-            else:
-                model = whisper.load_model(
-                    self.options.get('model', 'base'),
-                    device=device,
-                    download_root=self.options.get('model_dir', None)
-                )
-                self.progress.emit(30)
-                self.status.emit("音声を抽出中...")
-                transcribe_options = {
-                    'language': self.options.get('language', None),
-                    'task': self.options.get('task', 'transcribe'),
-                    'temperature': self.options.get('temperature', 0),
-                    'best_of': self.options.get('best_of', 5),
-                    'beam_size': self.options.get('beam_size', 5),
-                    'patience': self.options.get('patience', None),
-                    'length_penalty': self.options.get('length_penalty', None),
-                    'suppress_tokens': self.options.get('suppress_tokens', '-1'),
-                    'initial_prompt': self.options.get('initial_prompt', None),
-                    'condition_on_previous_text': self.options.get('condition_on_previous_text', True),
-                    'fp16': self.options.get('fp16', True),
-                    'compression_ratio_threshold': self.options.get('compression_ratio_threshold', 2.4),
-                    'logprob_threshold': self.options.get('logprob_threshold', -1.0),
-                    'no_speech_threshold': self.options.get('no_speech_threshold', 0.6),
-                    'word_timestamps': self.options.get('word_timestamps', False),
-                    'prepend_punctuations': self.options.get('prepend_punctuations', r"\"'¿([{-"),
-                    'append_punctuations': self.options.get('append_punctuations', r"\"'.。,，!！?？:：”)]}、"),
-                }
-                transcribe_options = {k: v for k, v in transcribe_options.items() if v is not None}
-                if device == 'cpu' and transcribe_options.get('fp16'):  # CPU では fp16 無効
-                    transcribe_options['fp16'] = False
-                self.progress.emit(50)
-                self.status.emit("文字起こしを実行中...")
-                result = model.transcribe(self.video_path, **transcribe_options)
-                self.progress.emit(90)
-                self.status.emit("結果を処理中...")
-                segments = [{
-                    'start': s['start'], 'end': s['end'], 'text': s['text'].strip(), 'id': s['id']
-                } for s in result['segments']]
-                transcription_result = {
-                    'text': result['text'],
-                    'segments': segments,
-                    'language': result.get('language', 'unknown')
-                }
-            
+            # 高度処理: advanced_process_video のみ利用
+            adv_result = advanced_process_video(
+                self.video_path,
+                model_size=self.options.get('model', 'large-v3'),
+                segmentation_model_size=self.options.get('segmentation_model_size', 'turbo'),
+                seg_mode=self.options.get('seg_mode', 'hybrid'),
+                ja_weight=self.options.get('ja_weight', 0.80),
+                ru_weight=self.options.get('ru_weight', 1.25),
+                ru_accent_boost=self.options.get('ru_accent_boost', 0.0),
+                min_seg_dur=self.options.get('min_seg_dur', 0.60),
+                ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
+                vad_level=self.options.get('vad_level', 2),
+                gap_threshold=self.options.get('gap_threshold', 0.5),
+                output_format=self.options.get('output_format', 'txt'),
+                srt_max_line=self.options.get('srt_max_line', 50),
+                include_silent=self.options.get('include_silent', False),
+                debug=self.options.get('debug_segments', False),
+                progress_callback=lambda p: self.progress.emit(p)
+            )
+            transcription_result = adv_result
             self.progress.emit(100)
             self.status.emit("文字起こし完了")
             self.finished_transcription.emit(transcription_result)
             
         except Exception as e:
+            # 標準出力へスタックトレース付きでエラー表示
+            print("[ERROR] Transcription thread exception:", e)
+            traceback.print_exc()
             self.error.emit(str(e))
             self.status.emit("エラーが発生しました")
