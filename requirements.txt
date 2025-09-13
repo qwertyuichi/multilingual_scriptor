@@ -5,3 +5,4 @@ scipy
 ffmpeg-python
 webrtcvad
 PySide6
+tomli; python_version < "3.11"
