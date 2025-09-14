@@ -1,4 +1,50 @@
-/.venv
-/old
-/video
-/output
+## Python キャッシュ / ビルド
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+## 仮想環境 / 環境管理
+.venv/
+venv/
+env/
+.env
+.python-version
+
+## ログ / 一時ファイル
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+
+## IDE / エディタ
+.vscode/
+.idea/
+*.code-workspace
+
+## OS 生成物
+Thumbs.db
+.DS_Store
+
+## アプリ生成物 / モデル / 出力
+output/
+video/
+old/
+models/
+cache/
+whisper_cache/
+
+## その他保持したくないもの（必要なら調整）
+*.mp4
+*.wav
+*.jsonl
+*.srt
+*.txt
+
+# 明示的に追跡したい特定ファイルがある場合は ! で除外解除する (例)
+#!video/sample_keep.mp4

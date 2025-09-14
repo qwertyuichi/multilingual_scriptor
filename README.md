@@ -1,232 +1,220 @@
-# 音声認識（日本語 / ロシア語 セグメント再トランスクリプト）
+<br>
 
-`transcription_for_kapra.py` は動画 (mp4 等) から音声を抽出し、OpenAI Whisper ローカルモデルを用いて
-1回目に全体を粗く文字起こし → 各セグメントを個別に再言語判定・再トランスクリプトする 2段階方式で、
-日本語とロシア語を主対象に確率ラベル付きの結果を生成します。
+# 動画文字起こし & セグメント編集 GUI (日露中心)
 
----
-## 特徴
-- FFmpeg で動画から 16kHz モノラル PCM 抽出
-- 初回 `model.transcribe` により粗いセグメント列を取得
-- 各セグメントを再度 切り出し & 言語(ja/ru)確率推定 (Whisper の `detect_language` を軽量ラップ)
-- 確率差が小さい(あいまい)場合、日/露 両言語で再トランスクリプト → `avg_logprob` 比較で良い方採用 (AMB 表示)
-- 日本語 / ロシア語確率に任意の重みを乗算しバイアス調整 (`--ja-weight`, `--ru-weight`) → 加重時は `[W]` タグ
-- VAD (webrtcvad) により無音/ノイズ区間をスキップ (閾値調整 `--vad-level`)
-- スキップや空結果・ギャップを可視化するプレースホルダ出力 `--include-silent`
-- デバッグ用 詳細ログ表示 (`--debug-segments`) で分割・言語判定・再トライ過程を追跡
-- ハルシネーション疑いの長い反復文字列に `[HALLUCINATION?]` タグ付与
-- 出力形式: `[開始 -> 終了][オプションタグ] [JA:xxx%] [RU:yyy%] テキスト`
-- 失敗時は初期セグメントの粗テキストへフォールバック
+Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シーク」「セグメント編集 (分割/結合/境界調整)」「部分再トランスクリプト」「書き出し (TXT / SRT / JSON)」を行うデスクトップツールです。日本語とロシア語を主対象に確率 (JA / RU) を保持しつつ編集できます。
 
 ---
-## 依存関係
-`requirements.txt` (主要):
+## 1. 主な特徴
+| 分類 | 機能概要 |
+|------|----------|
+| 初回文字起こし | Whisper 指定モデルで全編を一括処理 (日露混在可) |
+| 動画再生連動 | 再生位置に合わせてテーブル選択が自動追従 (逆シークも可) |
+| セグメント編集 | テキスト編集 / カーソル位置で 2 分割 / 動的分割 / 2 行境界のドラッグ的調整 (時間位置で再計算) |
+| 逐次反映 | セグメント確定ごとにテーブルへ即時追加 (進捗件数表示) |
+| モデル最適化 | 初回全文開始時に部分再文字起こし用モデルを事前ロード (ウォームアップ) |
+| 再トランスクリプト | 分割直後 / 境界調整直後 / 指定範囲(行)などで部分再実行 (バックグラウンド Thread) |
+| 言語確率 | JA / RU 推定確率を保持し優勢言語表示 / 手動で表示言語選択も可能 |
+| 書き出し | TXT / SRT / JSON |
+| コンフィグ | `config.toml` でモデル/デバイス/閾値等プリセット切替 |
+| UI 操作性 | ダブルクリックで該当開始秒へ再生 / 選択行が 1 行と 2 行で挙動切替 |
+
+---
+## 2. 画面概要
+左: 動画 + 再生コントロール / 右: セグメントテーブル & 編集操作パネル / 下部: ステータス & 進捗バー。テーブル列は概ね `START | END | LANG | JA_TEXT | RU_TEXT | JA% | RU% | FLAGS` のイメージ (実際の内部キーは `segments` リストに格納)。
+
+---
+## 3. インストール
+### 3.1 前提
+- Python 3.11+ 推奨 (標準 `tomllib` 利用)
+- FFmpeg (PATH 通し済み)
+- (任意) CUDA 対応 GPU
+
+### 3.2 依存パッケージ
+`requirements.txt`:
 ```
 openai-whisper
 torch
 numpy
 scipy
-ffmpeg-python
 webrtcvad
+PySide6
 ```
-追加システム要件:  
-- FFmpeg 実行バイナリ (パスが通っていること)  
-- GPU (任意) CUDA があれば高速化 / CPU のみでも可
 
-PowerShell (Windows) での FFmpeg 確認例:
+インストール例 (Windows PowerShell):
+```pwsh
+python -m venv .venv
+./.venv/Scripts/Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+FFmpeg 確認:
 ```pwsh
 ffmpeg -version
 ```
 
-FFmpeg 未導入なら (例: winget):
+---
+## 4. 起動
 ```pwsh
-winget install --id=Gyan.FFmpeg  -e --source winget
+python main.py
 ```
-
-Python パッケージのインストール:
-```pwsh
-pip install -r requirements.txt
-```
+初回起動時に `config.toml` の `[default]` セクション値を GUI へ反映します。別プリセット (例: `[kapra]`) へ切替する UI がある場合はそちらから再読込できます。
 
 ---
-## 使い方
-基本:
-```pwsh
-python transcription_for_kapra.py "video\サンプル動画.mp4" --model large-v3
-```
-
-出力をファイル保存:
-```pwsh
-python transcription_for_kapra.py "video\サンプル動画.mp4" --model large-v3 -o result.txt
-```
-
-### 引数一覧
-| 引数 | 必須 | 説明 | 例 |
-|------|------|------|----|
-| `video_path` | はい | 入力動画ファイルパス | `video\example.mp4` |
-| `--model` | いいえ | Whisper モデルサイズ (`tiny`…`large-v3`) | `--model small` |
-| `--output`, `-o` | いいえ | 出力テキストファイル | `-o out.txt` |
-| `--ja-weight` | いいえ | 日本語確率へ乗算する重み (初期 1.0) | `--ja-weight 1.2` |
-| `--ru-weight` | いいえ | ロシア語確率へ乗算する重み (初期 1.0) | `--ru-weight 1.8` |
-| `--ambiguous-threshold` | いいえ | JA/RU 確率差 (%) がこの値未満なら両言語で再トライ | `--ambiguous-threshold 12` |
-| `--vad-level` | いいえ | VAD 厳しさ 0(寛容)〜3(厳格) | `--vad-level 1` |
-| `--include-silent` | いいえ | スキップ/ギャップ/空結果プレースホルダを出力 | `--include-silent` |
-| `--debug-segments` | いいえ | 初期分割と判定過程の詳細ログ | `--debug-segments` |
-| `--gap-threshold` | いいえ | ギャップ表示する最小秒数 (`--include-silent` 有効時) | `--gap-threshold 0.25` |
-
-
+## 5. 基本操作フロー
+1. 右上/上部の「動画を開く」ボタンで MP4 等を選択
+2. 「文字起こし開始」を押下 → モデル読み込み & 全体セグメント生成
+3. 再生しながら内容確認（テーブル行クリックでシーク）
+4. 必要に応じて編集: 
+   - 1 行選択 + ボタン: 現在再生位置で動的分割 → 分割後 2 区間を自動で再トランスクリプト
+   - 2 行連続選択 + ボタン: 両行境界を現在再生位置へ移動 → 双方を再トランスクリプト
+   - 行ダブルクリック: 詳細編集ダイアログ (JA/RU テキスト編集 / カーソル分割)
+  - 不要行選択 → 削除: セグメントを物理削除
+5. エクスポート: 書き出し形式 (TXT / SRT / JSON) を選んで保存
 
 ---
-## ディレクトリ構成（例）
-```
-音声認識/
-  transcription_for_kapra.py
-  requirements.txt
-  README.md (本ファイル)
-  video/
-    sample.mp4
-  temp_segments/        # 任意: 中間検証用 (現スクリプトは直接ここを使っていません)
-  temp_langprob/        # 任意: 言語判定用に保存する場合の例 (現スクリプトは直接ここを使っていません)
-  old/
-    whisper_test.py
-```
+## 6. セグメント編集詳細
+| 操作 | 条件 | 動作 |
+|------|------|------|
+| 行ダブルクリック | 任意行 | 編集ダイアログ (JA/RU 切替, テキスト修正, カーソル分割) |
+| 1 行選択 + 分割ボタン | 任意行 | 現在再生位置で 2 分割 (閾値未満の極小断片は拒否) |
+| 2 行連続選択 + 境界調整 | 任意行 | 境界を現在再生位置へ移動 (最小長確保) |
+| 複数行選択 + 削除 | 任意行 | セグメント削除 (番号再採番) |
+| カーソル分割 (編集ダイアログ) | テキスト内カーソル位置 | 言語別テキスト長比で開始/終了時間を線形割当 |
+
+再トランスクリプトは時間枠確定後に順次スレッドで実行され、完了ごとにテーブル更新。実行中は関連ボタンが無効化され進捗バーが進む。
 
 ---
-## 処理フロー (Mermaid 概要)
-```mermaid
-flowchart TD
-  A[開始] --> B[引数解析]
-  B --> C{動画ファイル存在?}
-  C -- いいえ --> E[エラーメッセージ表示 終了]
-  C -- はい --> F[Whisperモデル読み込み]
-  F --> G[FFmpegで音声抽出(16kHz mono)]
-  G --> H[初回 transcribe (自動言語)]
-  H --> I[segments ループ]
-  I --> J{次 segment?}
-  J -- なし --> O[出力結合]
-  J -- あり --> K[開始/終了→サンプル計算]
-  K --> L[長さ/範囲チェック]
-  L -- 短い --> I
-  L -- OK --> M[言語判定 (ja/ru 確率)]
-  M --> M2{確率差 < 閾値?}
-  M2 -- はい --> M3[ja/ru 両言語再トライ + avg_logprob比較]
-  M2 -- いいえ --> N[選択言語で再 transcribe]
-  M3 --> P{結果空?}
-  N --> P{結果空?}
-  P -- はい --> I
-  P -- いいえ --> Q[確率/時刻フォーマット行追加]
-  Q --> I
-  O --> R{--output 指定?}
-  R -- はい --> S[ファイル保存]
-  R -- いいえ --> T[標準出力]
-  S --> U[終了]
-  T --> U[終了]
+## 7. 書き出し形式
+| 形式 | 拡張子 | 内容 |
+|------|--------|------|
+| TXT | `.txt` | `[HH:MM:SS.mmm -> HH:MM:SS.mmm] [JA:xx.xx%] [RU:yy.yy%] JA=... | RU=...` 行列 |
+| SRT | `.srt` | 標準 SRT。優勢 (確率が高い) 言語テキストを採用。連番 + 時刻範囲 + 本文 |
+| JSON | `.json` | 全セグメントを 1 つの JSON オブジェクトに集約。`{"segments": [...], "metadata": {...}}` のような形で、各セグメント要素は `start,end,text,text_ja,text_ru,ja_prob,ru_prob,chosen_language` 等を保持 |
+
+`exporter.py` が共通ロジック。GUI は内部結果 (`transcription_result['segments']`) をそのまま利用し JSON ではまとめて 1 ファイルに格納します。
+
+---
+## 8. セグメントデータ構造 (概念)
+```jsonc
+{
+  "start": 12.345,      // 秒
+  "end": 15.678,
+  "text": "表示用(選択言語)",
+  "text_ja": "日本語候補",
+  "text_ru": "ロシア語候補",
+  "ja_prob": 72.13,     // %
+  "ru_prob": 24.91,
+  "chosen_language": "ja" | "ru" | null,
+  // gap フラグは廃止済み
+}
 ```
 
 ---
-## 出力タグ一覧
-| タグ | 意味 |
-|------|------|
-| `[W]` | 言語確率に重み付け (ja/ru weight ≠ 1.0) 適用済み |
-| `AMB` | JA/RU 確率差が閾値未満 → 両言語再トライし良い方採用 |
-| `[SKIP:silence vad=X]` | VAD で無音判定され処理スキップ (X=VAD level) |
-| `[SKIP:too_short]` | 0.1 秒未満でスキップ |
-| `[EMPTY]` | 再トランスクリプト結果が空 |
-| `[GAP:x.xx s]` | 前後セグメント間に x.xx 秒以上の空白区間 |
-| `[HALLUCINATION?]` | 長い反復文字列を検出し疑わしいと判断 |
-
----
-## デバッグ・診断手順例
-1. 欠落したと感じる時間帯がある → `--include-silent --debug-segments` を付け再実行
-2. `[DEBUG] 初期セグメント一覧` を確認し該当時間帯の行が存在するか判定
-3. 存在しない: Whisper 初期分割で生成されていない → モデル/temperature/VAD 無効化検証
-4. 存在するが `[SKIP:*]` 表示: スキップ理由 (silence / too_short) を調整 (`--vad-level` 変更)
-5. `[EMPTY]` のみ: 音量極小や語彙外 → 同区間重ね録り / モデルサイズ変更
-6. 改善後差異を比較するには出力テキスト差分を取る (PowerShell: `Compare-Object` 等)
-
-### 例: ロシア語判定を強めつつデバッグ
-```pwsh
-python transcription_for_kapra.py "video\sample.mp4" --model large-v3 \
-  --ru-weight 1.8 --ambiguous-threshold 15 --vad-level 1 \
-  --include-silent --debug-segments --gap-threshold 0.25
+## 9. 設定 (`config.toml`)
+`[default]` 例:
+```toml
+[default]
+device = "cuda"            # cpu / cuda
+transcription_model = "large-v3"
+segmentation_model = "turbo"
+default_languages = ["ja", "ru"]
+ja_weight = 1.0
+ru_weight = 1.0
+min_seg_dur = 0.60
+vad_level = 2
+# gap_threshold = 0.5 (旧: 無音→GAP 生成用。現在は内部タイミング調整用途のみ/または未使用)
+ambiguous_threshold = 30.0
+include_silent = true
+output_format = "json"     # txt / srt / json
+initial_prompt = ""
 ```
+別プリセット `[kapra]` などを追加して GUI で切替可 (実装状況に依存)。
 
 ---
-## 言語確率の重み付けロジック
-- Whisper の生確率 (ja_prob, ru_prob) を 0-1 に戻しそれぞれ指定重みを乗算 → 正規化
-- 例: JA=0.6, RU=0.4, `--ru-weight 1.5` → JA=0.6, RU=0.4*1.5=0.6 → 正規化後 JA=50%, RU=50%
-- 重みは「最終判定前のバイアス」なので AMB 判定にも効く (差が縮まりやすく再トライ誘発する場合あり)
-- 過度に重みを上げると他方が常に 0% 近くになり AMB が起きにくくなるため注意
+## 10. アーキテクチャ概要
+| モジュール | 役割 |
+|------------|------|
+| `main.py` | GUI 本体 (再生/編集/スレッド管理) |
+| `transcriber.py` | Whisper + VAD + 部分再文字起こしスレッド (`TranscriptionThread` / `RangeTranscriptionThread`) |
+| `models/segment.py` | `Segment` データクラス & リスト操作補助 |
+| `services/segment_ops.py` | 分割・境界調整など純粋操作 |
+| `services/retranscribe_ops.py` | 動的時間分割・連続結合等の高レベル再処理 |
+| `ui/table_presenter.py` | テーブル構築・集約テキスト再構築 |
+| `exporter.py` | TXT / SRT 文字列生成 & JSON ペイロード |
+| `utils/timefmt.py` | 時刻フォーマットユーティリティ |
+| `utils/segment_utils.py` | 表示テキスト整形 / ID 正規化 |
+
+スレッド完了シグナル → GUI スロットで `segments` 更新 → `table_presenter` 経由で再描画、の流れ。
 
 ---
-## コード改善提案（任意）
-| 項目 | 現状 | 改善案 | 期待効果 |
-|------|------|--------|----------|
-| `n_mels` 動的化 | 実装済 | 80/128 自動検出 | モデル差異吸収 |
-| 可変長パディング | 実装済 | 2〜30秒のみ調整 | 過剰 pad 回避 |
-| VAD スキップ | 実装済 | 閾値調整/無効化対応 | ノイズ削減 |
-| AMB 再トライ | 実装済 | avg_logprob 比較 | あいまい改善 |
-| 言語重み付け | 実装済 | ja/ru weight | バイアス制御 |
-| ハルシネ検出 | 実装済 | 反復文字縮約 | ノイズ抑止 |
-| プレースホルダ | 実装済 | GAP / SKIP / EMPTY | 欠落原因可視化 |
-| 並列化 | 未 | マルチプロセス | 速度向上 |
-| faster-whisper | 未 | CTranslate2 | 高速化 |
-| 多言語汎化 | 部分 | 他言語閾値導入 | 誤検出低減 |
-| JSON/SRT 出力 | 未 | フォーマット追加 | 連携容易 |
-
-
-### `n_mels` を標準へ戻す例
-`detect_language_probabilities` 内:
-```python
-# 変更前
-mel = whisper.log_mel_spectrogram(audio_segment, n_mels=128).to(model.device)
-# 変更後
-mel = whisper.log_mel_spectrogram(audio_segment).to(model.device)
-```
+## 11. トラブルシュート
+| 症状 | 主原因候補 | 対処 |
+|------|------------|------|
+| ffmpeg が見つからない | PATH 未設定 | FFmpeg インストール & パス確認 (`ffmpeg -version`) |
+| GPU が使われない | CUDA ドライバ不足 / CPU ビルド | `torch.cuda.is_available()` 確認 / ドライバ更新 |
+| 途中でフリーズ感 | 長時間モデル推論 | 進捗バー運用 / 小さいモデルへ変更 |
+| 再分割が無効 | 再生位置が端 / 最小長未満 | 再生位置を中央付近に調整 |
+| SRT 文字化け | エディタの文字コード | UTF-8 (BOM 無) で開く |
+| JSON が空 (segments が 0) | セグメントが GAP のみ / 全て除外 | GAP 変換し過ぎていないか確認 |
 
 ---
-## よくあるエラーと対処
-| 症状 | 原因候補 | 対処 |
-|------|----------|------|
-| `FileNotFoundError: ffmpeg` | FFmpeg 未導入 or PATH 未設定 | FFmpeg インストールし PATH 追加 |
-| CUDA 関連警告 | GPU 未検出 / ドライバ不整合 | CPU で続行可、必要ならドライバ更新 |
-| メモリ不足 | large 系モデル使用 | smaller モデル or GPU / 量子化導入 |
-| 言語が逆判定 | 短区間 / ノイズ | セグメント長調整 / 閾値導入 |
+## 12. パフォーマンス & 改善余地
+- smaller モデル選択 / GPU 利用
+- faster-whisper (CTranslate2) 置換検討
+- 連続複数セグメントの一括再トランスクリプト最適化
+- 事前 VAD マスク適用で無音区間スキップ向上
 
 ---
-## パフォーマンスチューニング簡易メモ
-- モデルサイズ縮小: `small` / `medium` で速度向上
-- `temperature` を低く維持 → 安定性優先 (既に 0.2)
-- faster-whisper (CTranslate2) へ移行し `compute_type="int8_float16"` などを検討
-- セグメント再トランスクリプトを条件付き（確率差が小さい時のみ など）にする
+## 13. ライセンス / 出典
+- OpenAI Whisper (MIT) https://github.com/openai/whisper
+- 本ツール: ライセンス未記載（必要なら `LICENSE` 追加推奨: MIT など）
 
 ---
-## ライセンス / 出典
-- OpenAI Whisper: MIT License (https://github.com/openai/whisper)
-- 本スクリプト: （未設定。必要に応じて MIT などを追記してください）
+## 14. 開発メモ / 今後のアイデア
+- SRT 行長自動折返し最適化
+- Waveform 可視化オーバーレイ
+- 英語追加 / 多言語 UI
+- モデルキャッシュ管理 UI
+- バッチ一括処理 (フォルダドロップ)
 
 ---
-## チェックリスト（運用）
-- [ ] FFmpeg が動作する
-- [ ] Python 依存関係インストール済
-- [ ] GPU (任意) が利用可能か `torch.cuda.is_available()` で確認
-- [ ] `--model` を適切に選定
-- [ ] 出力文字コード UTF-8 (外部連携時に確認)
+## 15. 簡易チェックリスト
+- [ ] FFmpeg 動作確認
+- [ ] `pip install -r requirements.txt`
+- [ ] `python main.py` 起動
+- [ ] 文字起こし完了後 テーブル表示
+- [ ] 逐次追加（セグメントが徐々に増えていく）
+- [ ] 分割 / 境界調整 / 削除 が機能
+- [ ] 書き出し成功 (TXT / SRT / JSON)
 
 ---
-## 変更履歴 (例)
-| 日付 | 内容 |
-|------|------|
-| 2025-09-12 | 初回 README 作成 |
-| 2025-09-12 | VAD / AMB / 重み付け / デバッグオプション / タグ説明追記 |
+## 16. 逐次更新 / モデル事前ロード / キャンセル挙動
+
+### 16.1 逐次更新
+従来は全文完了後にまとめてテーブルへ表示していましたが、現在は Whisper 推論で 1 セグメント確定するたびに即座にテーブル最下行へ追加し、ステータスバーに件数 `(N)` を表示します。これにより長時間動画でも途中経過を確認しながら編集方針を検討できます。
+
+### 16.2 モデル事前ロード (ウォームアップ)
+全文文字起こし開始直後に以下をキャッシュへロードします。
+1. セグメンテーション用モデル (`segmentation_model_size`)
+2. メイン文字起こしモデル (`model`)
+
+部分再文字起こし (範囲選択 → 再文字起こし) は同じモデルインスタンスを再利用するため、初回のロード遅延がほぼ解消されます。
+
+### 16.3 キャンセル挙動
+キャンセル要求後は:
+- 進行中スレッドへキャンセルフラグ送信
+- 既に表示済みの途中結果は即座にクリア (テーブル行数 0 / 内部 `segments` 初期化)
+- 以降遅延して届く逐次セグメントシグナルは無視されます
+
+これにより「一度キャンセルしたのに途中結果が残っていた」混乱を防ぎます。部分結果を保持したい場合はキャンセルではなく一時停止や再生操作で確認してください。
+
+### 16.4 既知の注意
+- 大量行(数千) の逐次追加でスクロールが頻繁に動く場合、将来的にバッチ描画最適化を追加予定です。
+- キャンセル直後に別動画を開いた際、まれに旧スレッドから遅延シグナルが届いても無視されるようガードしています。
 
 ---
-## 今後の発展アイデア
-- Web UI (Gradio / Streamlit) 化
-- 多言語拡張 (英語/韓国語等) と自動翻訳パイプライン
-- 信頼度指標 (平均 logprob) 付与
-- JSON / SRT / VTT など字幕フォーマット出力
-- バッチ処理ディレクトリ対応
 
 ---
-ご不明点や追加したい項目があればお知らせください。
+ご要望・改善案があれば Issue / コメントなどでお知らせください。

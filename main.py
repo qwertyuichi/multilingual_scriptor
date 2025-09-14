@@ -31,7 +31,14 @@ import logging
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from transcriber import TranscriptionThread
+from models.segment import Segment, as_segment_list
 import torch
+from utils.timefmt import format_ms, parse_to_ms, to_srt_timestamp
+from utils.segment_utils import display_text, normalize_segment_id
+from exporter import build_export_text, build_json_payload
+from ui.table_presenter import rebuild_aggregate_text, populate_table
+from services.segment_ops import split_segment_at_position, adjust_boundary
+from services.retranscribe_ops import dynamic_time_split, merge_contiguous_segments
 
 
 def get_whisper_model_names():
@@ -102,7 +109,7 @@ class VideoTranscriptionApp(QMainWindow):
         if not start_item:
             return
         start_str = start_item.text()
-        ms = self.parse_time_to_ms(start_str)
+        ms = parse_to_ms(start_str)
         try:
             self.media_player.setPosition(ms)
         except Exception:
@@ -131,20 +138,17 @@ class VideoTranscriptionApp(QMainWindow):
         return self.open_edit_dialog_for_row(row, col)
 
     def open_edit_dialog_for_row(self, row: int, col: int):
-        """編集画面: テキスト編集 / カーソル位置分割。表示言語は JA/RU ラジオで選択しフォーカスとも連動。GAP 行は無視。"""
+        """編集画面: テキスト編集 / カーソル位置分割。表示言語は JA/RU ラジオで選択しフォーカスとも連動。"""
         if not self.transcription_result:
             return
         segs = self.transcription_result.get('segments', [])
         if row < 0 or row >= len(segs):
             return
         seg = segs[row]
-        if seg.get('gap'):
-            return
         text_ja = seg.get('text_ja', '')
         text_ru = seg.get('text_ru', '')
-        # どちらも空なら何もしない
-        if not (text_ja or text_ru):
-            return
+        # 以前は「どちらも空なら編集不要」として return していたが、
+        # テキスト消去後に再入力したいケースを許容するため空でも編集ダイアログを開く。
 
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout, QMessageBox, QCheckBox
         from PySide6.QtCore import Qt
@@ -332,90 +336,60 @@ class VideoTranscriptionApp(QMainWindow):
         return
 
     def perform_segment_split(self, row: int, which: str, pos: int):
-        """選択行セグメントをカーソル位置で 2 分割し 前半->後半 の順で両方再文字起こしする。"""
-        segs = self.transcription_result.get('segments', []) if self.transcription_result else []
-        if row < 0 or row >= len(segs):
+        """選択行セグメントを pos 位置で 2 分割し 前半/後半を再文字起こし。"""
+        if not getattr(self, 'transcription_result', None):
             return
-        seg = segs[row]
-        if seg.get('gap'):
+        original = self.transcription_result.get('segments', [])
+        new_list = split_segment_at_position(original, row, which, pos)
+        if new_list is original or len(new_list) == len(original):
             return
-        text_ja = seg.get('text_ja', '')
-        text_ru = seg.get('text_ru', '')
-        base_text = text_ja if which == 'ja' else text_ru
-        if not base_text or pos <= 0 or pos >= len(base_text):
-            return
-        start = float(seg.get('start', 0.0))
-        end = float(seg.get('end', start))
-        if end <= start:
-            return
-        dur = end - start
-        ratio = pos / len(base_text)
-        mid_time = start + dur * ratio
-        # 新規2セグメント生成
-        def split_text(original_full: str):
-            if not original_full:
-                return '', ''
-            return original_full[:pos], original_full[pos:]
-        ja_1, ja_2 = split_text(text_ja)
-        ru_1, ru_2 = split_text(text_ru)
-        # 言語確率は単純に引き継ぎ（微調整しない）
-        ja_prob = seg.get('ja_prob', 0.0)
-        ru_prob = seg.get('ru_prob', 0.0)
-        # id は後流用: 既存 idx を前半に、後半は新規で最大+1 をベース
-        # 既存 id に str が混ざるケースに備え数値化（失敗時は enumerate の i を使用）
-        id_candidates = []
-        for i, s2 in enumerate(segs):
-            raw_id = s2.get('id', i)
-            if isinstance(raw_id, int):
-                id_candidates.append(raw_id)
-            else:
-                try:
-                    id_candidates.append(int(raw_id))
-                except Exception:
-                    id_candidates.append(i)
-        new_id_base = (max(id_candidates) + 1) if id_candidates else 0
-        first_seg = {
-            'start': start,
-            'end': mid_time,
-            'text': ja_1 if ja_prob >= ru_prob else ru_1,
-            'text_ja': ja_1,
-            'text_ru': ru_1,
-            'chosen_language': seg.get('chosen_language'),
-            'id': seg.get('id', row),
-            'ja_prob': ja_prob,
-            'ru_prob': ru_prob,
-        }
-        second_seg = {
-            'start': mid_time,
-            'end': end,
-            'text': ja_2 if ja_prob >= ru_prob else ru_2,
-            'text_ja': ja_2,
-            'text_ru': ru_2,
-            'chosen_language': seg.get('chosen_language'),
-            'id': new_id_base,
-            'ja_prob': ja_prob,
-            'ru_prob': ru_prob,
-        }
-        new_segments = []
-        for i, s in enumerate(segs):
-            if i == row:
-                new_segments.append(first_seg)
-                new_segments.append(second_seg)
-            else:
-                new_segments.append(s)
-        self.transcription_result['segments'] = new_segments
-
-        # 常に前後半を再文字起こし対象キューに積む（前→後）
-        re_jobs = [
-            ('front', first_seg['start'], first_seg['end']),
-            ('back', second_seg['start'], second_seg['end'])
-        ]
+        self.transcription_result['segments'] = new_list
+        front = new_list[row]
+        back = new_list[row+1]
+        re_jobs = [('front', front['start'], front['end']), ('back', back['start'], back['end'])]
         # 非同期連鎖実行
         self.range_retranscribing = True
         self._pending_rejobs = re_jobs
         self._split_row_base = row  # 後でどこに反映するか参照
         self._run_next_split_rejob()
+        self._update_split_button_state()
     # ---------------- 手動分割機能 ここまで ----------------
+
+    def _update_split_button_state(self):
+        """分割/動的分割/削除ボタンの活性状態を更新。"""
+        if not hasattr(self, 'split_button'):
+            return
+        busy = getattr(self, 'range_retranscribing', False)
+        result = getattr(self, 'transcription_result', None)
+        if not result:
+            self.split_button.setEnabled(False)
+            if hasattr(self, 'dynamic_split_button'):
+                self.dynamic_split_button.setEnabled(False)
+            if hasattr(self, 'delete_button'):
+                self.delete_button.setEnabled(False)
+            return
+        segs = result.get('segments', [])
+        rows = self._collect_selected_rows()
+        # 分割: 1行選択 & 非処理中
+        if busy or len(rows) != 1:
+            self.split_button.setEnabled(False)
+        else:
+            r = rows[0]
+            self.split_button.setEnabled(0 <= r < len(segs))
+        # 動的分割/境界調整: 1行または2行連続
+        if hasattr(self, 'dynamic_split_button'):
+            can_dyn = False
+            if not busy and rows:
+                if len(rows) == 1 and 0 <= rows[0] < len(segs):
+                    can_dyn = True
+                elif len(rows) == 2 and rows[1] == rows[0] + 1:
+                    r1, r2 = rows
+                    if 0 <= r1 < len(segs) and 0 <= r2 < len(segs):
+                        can_dyn = True
+            self.dynamic_split_button.setEnabled(can_dyn)
+        # 削除ボタン
+        if hasattr(self, 'delete_button'):
+            self.delete_button.setEnabled(bool(rows) and not busy and bool(segs))
 
     def _run_next_split_rejob(self):
         """分割後のキューに従って順次 RangeTranscriptionThread を起動。"""
@@ -424,6 +398,12 @@ class VideoTranscriptionApp(QMainWindow):
             self.range_retranscribing = False
             self._rebuild_text_and_refresh()
             self.status_label.setText("分割＆再文字起こし完了")
+            # ウォッチドッグ停止
+            try:
+                if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                    self._split_watchdog_timer.stop()
+            except Exception:
+                pass
             return
         job = self._pending_rejobs.pop(0)
         kind, start_sec, end_sec = job
@@ -444,154 +424,190 @@ class VideoTranscriptionApp(QMainWindow):
         self.range_thread = RangeTranscriptionThread(self.current_video_path, start_sec, end_sec, options)
         self.range_thread.progress.connect(self.on_range_progress)
         self.range_thread.status.connect(self.on_range_status)
-        self.range_thread.finished.connect(self._on_split_rejob_finished)
+        # range_finished に直接接続（旧 finished 廃止）
+        self.range_thread.range_finished.connect(self._on_split_rejob_finished)
         self.range_thread.error.connect(self._on_split_rejob_error)
         self.range_thread.start()
 
     def _on_split_rejob_finished(self, seg: dict):
-        # kind に応じて該当セグメントを上書き
+        """分割後の個別(前半/後半)再文字起こし完了ハンドラ。
+
+        不具合: 以前の実装は (1) transcription_result への書き戻し、(2) テーブルセル更新、
+        (3) 次ジョブ起動 / 最終確定 が行われずジョブキューが停止し `[再解析中]` が残留した。
+
+        対応: 上記全処理を追加し、ウォッチドッグは最終完了時のみ停止する。
+        """
+        if not getattr(self, 'transcription_result', None):
+            return
         kind = getattr(self, '_active_split_kind', None)
         base_row = getattr(self, '_split_row_base', None)
-        if kind is None or base_row is None:
+        if kind not in ('front', 'back') or base_row is None:
             return
-        segs = self.transcription_result.get('segments', [])
+        # セグメントリスト(オブジェクト化)
+        segs_obj = as_segment_list(self.transcription_result.get('segments', []))
         target_index = base_row if kind == 'front' else base_row + 1
-        if 0 <= target_index < len(segs):
-            old = segs[target_index]
-            # 既存時間枠は保持 (start/end は分割時点で正しい) -> ただし念のため seg から上書き
-            old.update({
-                'text': seg['text'],
-                'text_ja': seg['text_ja'],
-                'text_ru': seg['text_ru'],
-                'ja_prob': seg['ja_prob'],
-                'ru_prob': seg['ru_prob'],
-                'chosen_language': seg.get('chosen_language', old.get('chosen_language')),
+        if 0 <= target_index < len(segs_obj):
+            tgt = segs_obj[target_index]
+            tgt.update({
+                'text': seg.get('text', ''),
+                'text_ja': seg.get('text_ja', ''),
+                'text_ru': seg.get('text_ru', ''),
+                'ja_prob': float(seg.get('ja_prob', 0.0)),
+                'ru_prob': float(seg.get('ru_prob', 0.0)),
+                'chosen_language': seg.get('chosen_language') or seg.get('language') or tgt.get('chosen_language'),
             })
-        # 次へ
-        self._run_next_split_rejob()
-
-    def _on_split_rejob_error(self, err: str):
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.critical(self, "分割後再文字起こし失敗", err)
-        # 残りジョブ破棄
-        self._pending_rejobs = []
-        self.range_retranscribing = False
-        self._rebuild_text_and_refresh()
-        self.status_label.setText("分割は完了 / 再文字起こし一部失敗")
-
-    def _rebuild_text_and_refresh(self):
-        # text 再構築とリフレッシュ
+            # 空結果なら明示ラベル
+            if not tgt.text_ja and not tgt.text_ru:
+                tgt.text = tgt.text_ja = tgt.text_ru = '(空)'
+                tgt.ja_prob = 0.0
+                tgt.ru_prob = 0.0
+        # 書き戻し (他箇所は dict を前提)
         try:
-            segs = self.transcription_result.get('segments', [])
-            lines = []
-            for s in segs:
-                if s.get('gap'):
-                    lines.append('[GAP]')
-                else:
-                    # ユーザーが選択した言語(chosen_language)を優先して表示用テキストを決定
-                    chosen = s.get('chosen_language')
-                    text_ja = s.get('text_ja','')
-                    text_ru = s.get('text_ru','')
-                    jp = s.get('ja_prob',0.0); rp = s.get('ru_prob',0.0)
-                    if chosen == 'ja' and text_ja:
-                        display_text = text_ja
-                    elif chosen == 'ru' and text_ru:
-                        display_text = text_ru
-                    else:
-                        # 未選択 or 空の場合は従来通り確率で fallback
-                        display_text = text_ja if jp >= rp else text_ru
-                    # seg['text'] も同期（エクスポート等で利用される想定）
-                    s['text'] = display_text
-                    lines.append(display_text)
-            self.transcription_result['text'] = '\n'.join(lines)
+            self.transcription_result['segments'] = [s.to_dict() for s in segs_obj]
         except Exception:
             pass
-        self.display_transcription(self.transcription_result)
-        self._update_split_button_state()
+        # 対象行だけセルを部分更新（全再描画コスト削減）
+        try:
+            if 0 <= target_index < self.transcription_table.rowCount():
+                from PySide6.QtWidgets import QTableWidgetItem
+                from PySide6.QtGui import QColor
+                from utils.segment_utils import display_text
+                row = target_index
+                tgt = segs_obj[target_index]
+                # 新規アイテム生成（既存オブジェクト再利用しない）
+                ja_item = QTableWidgetItem(f"{tgt.ja_prob:.2f}")
+                ru_item = QTableWidgetItem(f"{tgt.ru_prob:.2f}")
+                if tgt.ja_prob >= tgt.ru_prob:
+                    ja_item.setForeground(QColor(200,0,0))
+                    ru_item.setForeground(QColor(0,0,180))
+                else:
+                    ru_item.setForeground(QColor(200,0,0))
+                    ja_item.setForeground(QColor(0,0,180))
+                txt_item = QTableWidgetItem(display_text(tgt))
+                self.transcription_table.setItem(row, 2, ja_item)
+                self.transcription_table.setItem(row, 3, ru_item)
+                self.transcription_table.setItem(row, 4, txt_item)
+        except Exception:
+            try:
+                self._rebuild_text_and_refresh()
+            except Exception:
+                pass
+        # 次ジョブ有無
+        if getattr(self, '_pending_rejobs', None):
+            # まだ残り → 次へ (ウォッチドッグ継続: タイマー延長)
+            try:
+                from PySide6.QtCore import QTimer as _QTimer
+                if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                    self._split_watchdog_timer.stop()
+                self._split_watchdog_timer = _QTimer(self)
+                self._split_watchdog_timer.setSingleShot(True)
+                self._split_watchdog_timer.timeout.connect(self._check_split_watchdog)
+                self._split_watchdog_timer.start(15000)
+            except Exception:
+                pass
+            self._run_next_split_rejob()
+            return
+        # 全ジョブ完了 → 集約テキスト再構築 & ステータス更新
+        try:
+            self.range_retranscribing = False
+            self._rebuild_text_and_refresh()
+            self.status_label.setText('分割＆再文字起こし完了')
+            self._update_split_button_state()
+        except Exception:
+            pass
+        # ウォッチドッグ停止
+        try:
+            if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                self._split_watchdog_timer.stop()
+        except Exception:
+            pass
+        # 後片付け
+        self._active_split_kind = None
+        try:
+            del self.range_thread
+        except Exception:
+            pass
 
-    def _update_split_button_state(self):
-        if not hasattr(self, 'split_button'):
+    def _on_split_rejob_error(self, err: str):
+        """分割後再文字起こしジョブでエラー発生時の回復処理。"""
+        try:
+            if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                self._split_watchdog_timer.stop()
+        except Exception:
+            pass
+        # ステータス表示とフラグ解除
+        self.status_label.setText(f"分割再文字起こし失敗: {err}")
+        self.range_retranscribing = False
+        # 残りジョブは破棄
+        if hasattr(self, '_pending_rejobs'):
+            self._pending_rejobs.clear()
+        # UI 再描画
+        try:
+            self._rebuild_text_and_refresh()
+        except Exception:
+            pass
+        # ユーザー通知
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "エラー", f"分割後再文字起こしでエラーが発生しました:\n{err}")
+        except Exception:
+            pass
+
+    def delete_selected_segments(self):
+        """選択行のテキスト列を空にする（時間/ID/確率は保持）。"""
+        if getattr(self, 'range_retranscribing', False):
             return
         if not getattr(self, 'transcription_result', None):
-            self.split_button.setEnabled(False)
-            if hasattr(self, 'gap_button'):
-                self.gap_button.setEnabled(False)
-            if hasattr(self, 'dynamic_split_button'):
-                self.dynamic_split_button.setEnabled(False)
             return
-        if getattr(self, 'range_retranscribing', False):
-            self.split_button.setEnabled(False)
-            if hasattr(self, 'gap_button'):
-                self.gap_button.setEnabled(False)
-            if hasattr(self, 'dynamic_split_button'):
-                self.dynamic_split_button.setEnabled(False)
-            return
-        rows = self._collect_selected_rows()
-        if len(rows) != 1:
-            self.split_button.setEnabled(False)
-        else:
-            segs = self.transcription_result.get('segments', [])
-            r = rows[0]
-            if r < 0 or r >= len(segs) or segs[r].get('gap'):
-                self.split_button.setEnabled(False)
-            else:
-                self.split_button.setEnabled(True)
         segs = self.transcription_result.get('segments', [])
-        # GAPボタン有効判定（1つ以上選択かつ少なくとも1つ gap False の行）
-        if hasattr(self, 'gap_button'):
-            can_gap = False
-            if rows and segs:
-                for r in rows:
-                    if 0 <= r < len(segs) and not segs[r].get('gap'):
-                        can_gap = True
-                        break
-            self.gap_button.setEnabled(can_gap and not getattr(self, 'range_retranscribing', False))
-        # 動的分割/境界調整ボタン: 1行非gap または 2行連続非gap
-        if hasattr(self, 'dynamic_split_button'):
-            can_dyn = False
-            if rows:
-                if len(rows) == 1:
-                    r = rows[0]
-                    if 0 <= r < len(segs) and not segs[r].get('gap'):
-                        can_dyn = True
-                elif len(rows) == 2 and rows[1] == rows[0] + 1:
-                    r1, r2 = rows
-                    if 0 <= r1 < len(segs) and 0 <= r2 < len(segs) and not segs[r1].get('gap') and not segs[r2].get('gap'):
-                        can_dyn = True
-            if getattr(self, 'range_retranscribing', False):
-                can_dyn = False
-            self.dynamic_split_button.setEnabled(can_dyn)
-
-    def convert_selected_to_gap(self):
-        """選択されている行(複数可)を GAP 行に変換する。既に GAP の行はスキップ。"""
-        if not getattr(self, 'transcription_result', None):
-            return
-        if getattr(self, 'range_retranscribing', False):
+        if not segs:
             return
         rows = self._collect_selected_rows()
         if not rows:
             return
-        segs = self.transcription_result.get('segments', [])
-        changed = False
+        changed = 0
         for r in rows:
             if 0 <= r < len(segs):
                 seg = segs[r]
-                if seg.get('gap'):
-                    continue
-                seg['gap'] = True
-                seg['text'] = ''
-                seg['text_ja'] = ''
-                seg['text_ru'] = ''
-                seg['chosen_language'] = None
-                seg['ja_prob'] = 0.0
-                seg['ru_prob'] = 0.0
-                changed = True
-        if changed:
-            self._rebuild_text_and_refresh()
-            self.status_label.setText("選択行をGAP化しました")
+                if any(seg.get(k) for k in ('text','text_ja','text_ru')):
+                    seg['text'] = ''
+                    seg['text_ja'] = ''
+                    seg['text_ru'] = ''
+                    changed += 1
+        if changed == 0:
+            return
+        # 集約テキスト再構築
+        try:
+            from transcriber import rebuild_aggregate_text
+            self.split_button.setEnabled(False)
+        except Exception:
+            pass
+        # テーブル部分更新
+        try:
+            for r in rows:
+                if 0 <= r < self.transcription_table.rowCount():
+                    item = self.transcription_table.item(r, 4)
+                    if item is None:
+                        from PySide6.QtWidgets import QTableWidgetItem
+                        item = QTableWidgetItem('')
+                        self.transcription_table.setItem(r, 4, item)
+                    else:
+                        item.setText('')
+        except Exception:
+            self.display_transcription(self.transcription_result)
+        self.status_label.setText(f"{changed}行のテキストを消去しました")
+        if hasattr(self, 'delete_button'):
+            self.delete_button.setEnabled(False)
         self._update_split_button_state()
+        # 削除ボタン: 何か選択されていれば有効 (処理中除く)
+        if hasattr(self, 'delete_button'):
+            can_del = bool(rows) and not getattr(self, 'range_retranscribing', False) and bool(segs)
+            self.delete_button.setEnabled(can_del)
+
+    # 旧 GAP 機能は廃止済み
 
     def split_or_adjust_at_current_position(self):
+        segs = as_segment_list(self.transcription_result.get('segments', [])) if getattr(self, 'transcription_result', None) else []
         """1行選択: その行を現在の再生位置で時間を基準に二分。
         2行連続選択: 境界(前行.end / 後行.start)を現在位置に移動。
         いずれも前後2区間を再文字起こし (前→後)。"""
@@ -599,7 +615,7 @@ class VideoTranscriptionApp(QMainWindow):
             return
         if not getattr(self, 'transcription_result', None):
             return
-        segs = self.transcription_result.get('segments', [])
+        # segs は Segment オブジェクト
         rows = self._collect_selected_rows()
         if not rows:
             return
@@ -614,34 +630,63 @@ class VideoTranscriptionApp(QMainWindow):
             r = rows[0]
             if r < 0 or r >= len(segs):
                 return
-            seg = segs[r]
-            if seg.get('gap'):
+            new_list, front_index = dynamic_time_split(self.transcription_result.get('segments', []), r, cur_sec)
+            if new_list is None:
                 return
-            start = float(seg.get('start', 0.0))
-            end = float(seg.get('end', start))
-            if not (start < cur_sec < end):
-                return
-            text_ja = seg.get('text_ja', '')
-            text_ru = seg.get('text_ru', '')
-            ja_prob = seg.get('ja_prob', 0.0)
-            ru_prob = seg.get('ru_prob', 0.0)
-            chosen = seg.get('chosen_language')
-            if chosen == 'ja' and text_ja:
-                base_text = text_ja
-            elif chosen == 'ru' and text_ru:
-                base_text = text_ru
-            else:
-                base_text = text_ja if ja_prob >= ru_prob else text_ru
-            if not base_text:
-                return
-            ratio = (cur_sec - start) / (end - start)
-            pos = int(len(base_text) * ratio)
-            if pos <= 0 or pos >= len(base_text):
-                return
-            which = 'ja'
-            if base_text == text_ru and base_text != text_ja:
-                which = 'ru'
-            self.perform_segment_split(r, which, pos)
+            self.transcription_result['segments'] = new_list
+            # 再文字起こしキュー設定（perform_segment_split と同等手順）
+            front = new_list[front_index]
+            back = new_list[front_index + 1]
+            # 分割直後は旧テキスト断片を保持せず一旦空にしてプレースホルダ表示
+            for segx in (front, back):
+                # プレースホルダ明示: 完了前でも UI/編集ダイアログでわかるようにする
+                segx['text'] = '[再解析中]'
+                segx['text_ja'] = '[再解析中]'
+                segx['text_ru'] = '[再解析中]'
+                segx['ja_prob'] = 0.0
+                segx['ru_prob'] = 0.0
+                # 言語未確定扱い（確定前に display_text が ja/ru の空文字優先で消えるのを防ぐ）
+                segx['chosen_language'] = None
+            # 表示を即更新（[再解析中] プレースホルダ）
+            try:
+                # プレースホルダ文字列を TEXT 列へ直接入れる
+                for idx_tmp, segx in ((front_index, front), (front_index+1, back)):
+                    if 0 <= idx_tmp < self.transcription_table.rowCount():
+                        from PySide6.QtWidgets import QTableWidgetItem
+                        item = self.transcription_table.item(idx_tmp, 4)
+                        if item is None:
+                            item = QTableWidgetItem('[再解析中]')
+                            self.transcription_table.setItem(idx_tmp, 4, item)
+                        else:
+                            item.setText('[再解析中]')
+            except Exception:
+                pass
+            # 集約テキスト再構築
+            try:
+                from transcriber import rebuild_aggregate_text
+                rebuild_aggregate_text(self.transcription_result)
+            except Exception:
+                pass
+            self.range_retranscribing = True
+            self._pending_rejobs = [
+                ('front', front['start'], front['end']),
+                ('back', back['start'], back['end'])
+            ]
+            self._split_row_base = front_index
+            # ウォッチドッグ開始
+            try:
+                import time as _time
+                self._split_watchdog_start = _time.time()
+                from PySide6.QtCore import QTimer as _QTimer
+                if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                    self._split_watchdog_timer.stop()
+                self._split_watchdog_timer = _QTimer(self)
+                self._split_watchdog_timer.setSingleShot(True)
+                self._split_watchdog_timer.timeout.connect(self._check_split_watchdog)
+                self._split_watchdog_timer.start(15000)
+            except Exception:
+                pass
+            self._run_next_split_rejob()
             return
         # 2行連続選択: 境界移動
         if len(rows) == 2 and rows[1] == rows[0] + 1:
@@ -649,8 +694,6 @@ class VideoTranscriptionApp(QMainWindow):
             if r1 < 0 or r2 >= len(segs):
                 return
             seg1 = segs[r1]; seg2 = segs[r2]
-            if seg1.get('gap') or seg2.get('gap'):
-                return
             start = float(seg1.get('start', 0.0))
             mid = float(seg1.get('end', start))
             end = float(seg2.get('end', mid))
@@ -660,15 +703,27 @@ class VideoTranscriptionApp(QMainWindow):
             new_mid = cur_sec
             if new_mid - start < MIN_DUR or end - new_mid < MIN_DUR:
                 return
-            seg1['end'] = new_mid
-            seg2['start'] = new_mid
+            updated = adjust_boundary(self.transcription_result.get('segments', []), r1, new_mid, MIN_DUR)
+            self.transcription_result['segments'] = updated
             # 再文字起こしキュー
             self.range_retranscribing = True
             self._pending_rejobs = [
-                ('front', seg1['start'], seg1['end']),
-                ('back', seg2['start'], seg2['end'])
+                ('front', updated[r1]['start'], updated[r1]['end']),
+                ('back', updated[r2]['start'], updated[r2]['end'])
             ]
             self._split_row_base = r1
+            try:
+                import time as _time
+                self._split_watchdog_start = _time.time()
+                from PySide6.QtCore import QTimer as _QTimer
+                if hasattr(self, '_split_watchdog_timer') and self._split_watchdog_timer:
+                    self._split_watchdog_timer.stop()
+                self._split_watchdog_timer = _QTimer(self)
+                self._split_watchdog_timer.setSingleShot(True)
+                self._split_watchdog_timer.timeout.connect(self._check_split_watchdog)
+                self._split_watchdog_timer.start(15000)
+            except Exception:
+                pass
             self._run_next_split_rejob()
             return
         return
@@ -683,8 +738,8 @@ class VideoTranscriptionApp(QMainWindow):
             if not start_item or not end_item:
                 continue
             try:
-                st_ms = self.parse_time_to_ms(start_item.text())
-                ed_ms = self.parse_time_to_ms(end_item.text())
+                st_ms = parse_to_ms(start_item.text())
+                ed_ms = parse_to_ms(end_item.text())
                 st = st_ms / 1000.0
                 ed = ed_ms / 1000.0
                 if st <= pos_sec < ed:
@@ -889,59 +944,33 @@ class VideoTranscriptionApp(QMainWindow):
         button_layout.addWidget(self.seek_back_1_btn)
         button_layout.addWidget(self.seek_fwd_1_btn)
         button_layout.addWidget(self.seek_fwd_10_btn)
-
+        # 右寄せ余白
         button_layout.addStretch()
         control_layout.addLayout(button_layout)
-
         video_vlayout.addLayout(control_layout)
 
-        # 下側（テーブル + エクスポートバー）
+        # 下側（テーブル）
         table_container = QWidget()
         table_vlayout = QVBoxLayout(table_container)
         table_vlayout.setContentsMargins(0, 0, 0, 0)
         table_vlayout.setSpacing(4)
 
-        # エクスポート/編集バー
-        export_bar = QHBoxLayout()
-        export_bar.addStretch()
-
-        # 並び: 編集 → 現在位置で分割 → 結合＆再文字起こし → このテキストをGAP化 → 部分貸し出し → 全文書き出し...
-        self.split_button = QPushButton("このテキストを編集")
-        self.split_button.setEnabled(False)
-        self.split_button.setToolTip("選択した1行のテキストを編集、または分割します。GAP行や処理中は無効。")
-        self.split_button.clicked.connect(self.invoke_edit_dialog)
-        export_bar.addWidget(self.split_button)
-
-        self.dynamic_split_button = QPushButton("現在位置で分割")
-        self.dynamic_split_button.setEnabled(False)
-        self.dynamic_split_button.setToolTip("1行選択: その行を現在の再生位置で二分 / 2行連続選択: 境界を現在位置へ移動 (内部的には調整も可能)")
-        self.dynamic_split_button.clicked.connect(self.split_or_adjust_at_current_position)
-        export_bar.addWidget(self.dynamic_split_button)
-
-        self.retranscribe_button = QPushButton("結合＆再文字起こし")
-        self.retranscribe_button.setEnabled(False)
-        self.retranscribe_button.setToolTip("1行ならその区間を再文字起こし / 複数連続(≤30秒)なら結合して再文字起こし")
-        self.retranscribe_button.clicked.connect(self.retranscribe_selected)
-        export_bar.addWidget(self.retranscribe_button)
-
-        self.gap_button = QPushButton("このテキストをGAP化")
-        self.gap_button.setEnabled(False)
-        self.gap_button.setToolTip("選択した行(複数可)をテキスト削除し GAP 行に変換します")
-        self.gap_button.clicked.connect(self.convert_selected_to_gap)
-        export_bar.addWidget(self.gap_button)
-
-        self.partial_export_button = QPushButton("部分貸し出し")
+        # テーブル上部 右寄せエクスポートバー
+        top_export_bar = QHBoxLayout()
+        top_export_bar.setContentsMargins(0, 0, 0, 0)
+        top_export_bar.addStretch()
+        self.partial_export_button = QPushButton("部分書き出し")
         self.partial_export_button.setEnabled(False)
         self.partial_export_button.setToolTip("選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し")
         self.partial_export_button.clicked.connect(self.partial_export_selected)
-        export_bar.addWidget(self.partial_export_button)
-
+        top_export_bar.addWidget(self.partial_export_button)
         self.export_button = QPushButton("全文書き出し...")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self.export_transcription)
-        export_bar.addWidget(self.export_button)
+        top_export_bar.addWidget(self.export_button)
+        table_vlayout.addLayout(top_export_bar)
 
-        table_vlayout.addLayout(export_bar)
+    # 旧: 編集/分割/再文字起こし/テキスト消去バーは削除（コンパクト化）
 
         self.transcription_table = QTableWidget()
         table_style = """
@@ -1414,6 +1443,19 @@ class VideoTranscriptionApp(QMainWindow):
                 rows.add(i)
         return sorted(rows)
 
+    def _rebuild_text_and_refresh(self):
+        """集約テキスト再構築とテーブル再描画を一括実行。
+
+        以前存在していたメソッドが消えていたため再追加。複数行結合後の
+        即時縮約反映や分割後の再描画で使用する。
+        """
+        try:
+            from ui.table_presenter import rebuild_aggregate_text, populate_table
+            rebuild_aggregate_text(self.transcription_result)
+            populate_table(self.transcription_table, self.transcription_result)
+        except Exception:
+            pass
+
     def _can_retranscribe_selection(self, rows):
         if not self.transcription_result:
             return False
@@ -1421,7 +1463,7 @@ class VideoTranscriptionApp(QMainWindow):
         rows_sorted = sorted(rows)
         if not rows_sorted:
             return False
-        # 対象取得（GAP は許容）
+    # 対象取得
         try:
             target = [segs[i] for i in rows_sorted]
         except Exception:
@@ -1450,11 +1492,16 @@ class VideoTranscriptionApp(QMainWindow):
             pass
         # 進行中ならメニューは表示するが操作不可
         if getattr(self, 'range_retranscribing', False):
+            # 実行中は全アクション無効化したメニューのみ表示（順序は要求仕様に合わせる）
             menu = QMenu(self)
-            act_re = menu.addAction("結合＆再文字起こし")
-            act_part = menu.addAction("部分書き出し")
-            act_re.setEnabled(False)
-            act_part.setEnabled(False)
+            act_play_from_here = menu.addAction("ここから再生")
+            act_edit = menu.addAction("このテキストを編集")
+            # 並びを逆転: 結合→再分割
+            act_re = menu.addAction("これらの結合＆再文字起こし")
+            act_dynamic = menu.addAction("現在位置で分割＆再文字起こし")
+            act_delete = menu.addAction("選択行を削除")
+            for a in [act_play_from_here, act_edit, act_dynamic, act_re, act_delete]:
+                a.setEnabled(False)
             menu.exec(global_pos)
             return
         # 右クリックした位置の行を追加選択（未選択ならその行を単一選択）
@@ -1465,25 +1512,40 @@ class VideoTranscriptionApp(QMainWindow):
                 self.transcription_table.selectRow(row)
         rows = self._collect_selected_rows()
         menu = QMenu(self)
-        # ここから再生
+        # メニュー順序要求(更新): ここから再生 / このテキストを編集 / これらの結合＆再文字起こし / 現在位置で分割＆再文字起こし / 選択行を削除
         act_play_from_here = menu.addAction("ここから再生")
         act_edit = menu.addAction("このテキストを編集")
-        act_re = menu.addAction("結合＆再文字起こし")
-        act_part = menu.addAction("部分書き出し")
-        act_gap = menu.addAction("選択をGAP化")
+        act_re = menu.addAction("これらの結合＆再文字起こし")
+        act_dynamic = menu.addAction("現在位置で分割＆再文字起こし")
+        act_delete = menu.addAction("選択行を削除")
+        # 追加: 現在位置を START/END にセット
+        act_set_start = menu.addAction("現在位置をSTARTにセット")
+        act_set_end = menu.addAction("現在位置をENDにセット")
+
         # 可否判定
-        can_split = False
-        if len(rows) == 1 and not getattr(self, 'range_retranscribing', False):
-            segs = self.transcription_result.get('segments', [])
+        segs = self.transcription_result.get('segments', [])
+        # 編集可: 単一行
+        can_edit = False
+        if len(rows) == 1:
             r = rows[0]
-            if 0 <= r < len(segs) and not segs[r].get('gap'):
-                can_split = True
-        if not can_split:
+            if 0 <= r < len(segs):
+                can_edit = True
+        if not can_edit:
             act_edit.setEnabled(False)
+        # 動的分割/境界調整可: (1行) or (2行連続)
+        can_dynamic = False
+        if len(rows) == 1 and can_edit:
+            can_dynamic = True
+        elif len(rows) == 2:
+            r1, r2 = rows
+            if abs(r1 - r2) == 1:
+                if all(0 <= r < len(segs) for r in (r1, r2)):
+                    can_dynamic = True
+        if not can_dynamic:
+            act_dynamic.setEnabled(False)
         # 再生は単一／複数問わず、最初の行の start にシークできる場合のみ有効
         can_play = False
         if rows:
-            segs = self.transcription_result.get('segments', [])
             r0 = rows[0]
             if 0 <= r0 < len(segs):
                 try:
@@ -1493,20 +1555,35 @@ class VideoTranscriptionApp(QMainWindow):
                     pass
         if not can_play:
             act_play_from_here.setEnabled(False)
-        # 再文字起こし（複数連続 or 単一非GAP）
+        # 再文字起こし（複数連続 or 単一行）
         if not self._can_retranscribe_selection(rows):
             act_re.setEnabled(False)
+        # 削除は何か選択されていれば有効
         if not rows:
-            act_part.setEnabled(False)
-        # GAP化は 1つ以上選択され かつ 全て gap でない行が含まれる場合に有効
-        can_gap = False
-        if rows:
-            segs = self.transcription_result.get('segments', [])
-            # 既に gap のみ選択なら実行しても意味がないので無効
-            if any(0 <= r < len(segs) and not segs[r].get('gap') for r in rows):
-                can_gap = True
-        if not can_gap:
-            act_gap.setEnabled(False)
+            act_delete.setEnabled(False)
+        # START/END セット可否: 単一行選択 & 再文字起こし処理中でない
+        can_set_bounds = (len(rows) == 1 and not getattr(self, 'range_retranscribing', False))
+        if not can_set_bounds:
+            act_set_start.setEnabled(False)
+            act_set_end.setEnabled(False)
+        else:
+            # 位置取得できなければ無効化
+            try:
+                cur_sec = self.media_player.position()/1000.0
+                r0 = rows[0]
+                segs = self.transcription_result.get('segments', [])
+                if not (0 <= r0 < len(segs)):
+                    raise ValueError
+                seg = segs[r0]
+                s = float(seg.get('start',0.0)); e = float(seg.get('end', s))
+                # START 更新可能条件: cur < e (僅差許容) / END 更新可能条件: cur > s
+                if not (cur_sec < e - 0.01):
+                    act_set_start.setEnabled(False)
+                if not (cur_sec > s + 0.01):
+                    act_set_end.setEnabled(False)
+            except Exception:
+                act_set_start.setEnabled(False)
+                act_set_end.setEnabled(False)
         chosen = menu.exec(global_pos)
         if chosen is None:
             return
@@ -1524,12 +1601,49 @@ class VideoTranscriptionApp(QMainWindow):
                         pass
         elif 'act_edit' in locals() and chosen == act_edit and act_edit.isEnabled():
             self.invoke_edit_dialog()
+        elif chosen == act_dynamic and act_dynamic.isEnabled():
+            self.split_or_adjust_at_current_position()
         elif chosen == act_re and act_re.isEnabled():
             self.retranscribe_selected()
-        elif chosen == act_part and act_part.isEnabled():
-            self.partial_export_selected()
-        elif chosen == act_gap and act_gap.isEnabled():
-            self.convert_selected_to_gap()
+        elif chosen == act_delete and act_delete.isEnabled():
+            self.delete_selected_segments()
+        elif chosen == act_set_start and act_set_start.isEnabled():
+            # 単一行 start を現在位置に変更
+            rows2 = rows
+            if len(rows2) == 1:
+                r0 = rows2[0]
+                segs2 = self.transcription_result.get('segments', [])
+                if 0 <= r0 < len(segs2):
+                    try:
+                        cur_sec = self.media_player.position()/1000.0
+                        seg = segs2[r0]
+                        old_end = float(seg.get('end', cur_sec))
+                        if cur_sec < old_end - 0.01:  # 最低幅確保
+                            seg['start'] = cur_sec
+                            if cur_sec > old_end:
+                                seg['end'] = cur_sec + 0.01
+                            self._rebuild_text_and_refresh()
+                            self.status_label.setText(f"行 {r0} の START を {cur_sec:.3f}s に設定")
+                    except Exception:
+                        pass
+        elif chosen == act_set_end and act_set_end.isEnabled():
+            rows2 = rows
+            if len(rows2) == 1:
+                r0 = rows2[0]
+                segs2 = self.transcription_result.get('segments', [])
+                if 0 <= r0 < len(segs2):
+                    try:
+                        cur_sec = self.media_player.position()/1000.0
+                        seg = segs2[r0]
+                        old_start = float(seg.get('start', cur_sec))
+                        if cur_sec > old_start + 0.01:
+                            seg['end'] = cur_sec
+                            if cur_sec < old_start:
+                                seg['start'] = cur_sec - 0.01
+                            self._rebuild_text_and_refresh()
+                            self.status_label.setText(f"行 {r0} の END を {cur_sec:.3f}s に設定")
+                    except Exception:
+                        pass
 
     def on_auto_sync_toggled(self, checked: bool):
         """自動同期トグル: ON かつ再生中なら即座に現在位置で同期する。"""
@@ -1557,8 +1671,7 @@ class VideoTranscriptionApp(QMainWindow):
         r = rows[0]
         if r < 0 or r >= len(segs):
             return
-        if segs[r].get('gap'):
-            return
+        # 行存在チェックのみ
         self.open_edit_dialog_for_row(r, 0)
 
     def open_file(self):
@@ -1663,7 +1776,9 @@ class VideoTranscriptionApp(QMainWindow):
         if hasattr(self, 'retranscribe_button'):
             self.retranscribe_button.setEnabled(False)
         self.progress_bar.setValue(0)
-        self.status_label.setText("モデルを読み込み中...")
+        self.status_label.setText("文字起こし開始準備中...")
+        # 逐次追加用に結果初期化
+        self.transcription_result = {'text': '', 'segments': []}
 
         # 文字起こしスレッドを開始
         self.transcription_thread = TranscriptionThread(
@@ -1671,6 +1786,11 @@ class VideoTranscriptionApp(QMainWindow):
         )
         self.transcription_thread.progress.connect(self.update_progress)
         self.transcription_thread.status.connect(self.update_status)
+        # 逐次セグメント受信
+        try:
+            self.transcription_thread.segment_ready.connect(self.on_segment_ready)
+        except Exception:
+            pass
         self.transcription_thread.finished_transcription.connect(
             self.on_transcription_finished
         )
@@ -1694,6 +1814,7 @@ class VideoTranscriptionApp(QMainWindow):
 
     @Slot(dict)
     def on_transcription_finished(self, result):
+        # 最終同期（逐次で蓄積済みでも最終結果を信頼して再描画）
         self.transcription_result = result
         self.display_transcription(result)
         self.transcribe_button.setEnabled(True)
@@ -1705,6 +1826,39 @@ class VideoTranscriptionApp(QMainWindow):
             self.partial_export_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.status_label.setText("文字起こし完了")
+
+    @Slot(dict)
+    def on_segment_ready(self, seg_dict: dict):
+        # 逐次追加: transcription_result が初期化済み前提
+        try:
+            # レースガード: スレッドが既に差し替えられていないか確認
+            thr = getattr(self, 'transcription_thread', None)
+            if thr is None or not thr.isRunning():
+                return
+            if getattr(self, '_cancelled_during_transcribe', False):
+                return
+            segs = self.transcription_result.get('segments', []) if self.transcription_result else []
+            segs.append(seg_dict)
+            line = display_text(seg_dict)
+            if line:
+                current_text = self.transcription_result.get('text','') if self.transcription_result else ''
+                self.transcription_result['text'] = (current_text + ('\n' if current_text else '') + line)
+            row = self.transcription_table.rowCount()
+            self.transcription_table.insertRow(row)
+            def fmt_ms(ms:int)->str:
+                s = ms/1000.0
+                h = int(s//3600); m = int((s%3600)//60); sec = s%60
+                return f"{h:02d}:{m:02d}:{sec:06.3f}"[:-1]  # 末尾 1 桁切って mm
+            st_ms = int(seg_dict.get('start',0.0)*1000)
+            ed_ms = int(seg_dict.get('end',0.0)*1000)
+            self.transcription_table.setItem(row, 0, QTableWidgetItem(fmt_ms(st_ms)))
+            self.transcription_table.setItem(row, 1, QTableWidgetItem(fmt_ms(ed_ms)))
+            self.transcription_table.setItem(row, 2, QTableWidgetItem(f"{seg_dict.get('ja_prob',0.0):.2f}"))
+            self.transcription_table.setItem(row, 3, QTableWidgetItem(f"{seg_dict.get('ru_prob',0.0):.2f}"))
+            self.transcription_table.setItem(row, 4, QTableWidgetItem(seg_dict.get('text','')))
+            self.status_label.setText(f"文字起こし中... ({len(segs)})")
+        except Exception:
+            pass
 
     @Slot(str)
     def on_transcription_error(self, error_message):
@@ -1728,6 +1882,13 @@ class VideoTranscriptionApp(QMainWindow):
                 self.cancel_button.setEnabled(False)
             except Exception as e:
                 logging.getLogger(__name__).error(f"Cancel failed: {e}")
+            # 逐次表示を即停止し画面をクリア
+            try:
+                self.transcription_table.setRowCount(0)
+            except Exception:
+                pass
+            self.transcription_result = {'text': '', 'segments': []}
+            self._cancelled_during_transcribe = True
 
     def toggle_log_panel(self, checked: bool):
         if checked:
@@ -1738,72 +1899,14 @@ class VideoTranscriptionApp(QMainWindow):
             self.toggle_log_button.setText("▼ ログ表示")
 
     def display_transcription(self, result):
-        self.transcription_table.setRowCount(0)
-        segments = result.get("segments", [])
-        for seg in segments:
-            row = self.transcription_table.rowCount()
-            self.transcription_table.insertRow(row)
-            start_sec = seg.get("start", 0.0)
-            end_sec = seg.get("end", 0.0)
-            # 秒(float) -> ミリ秒フォーマット
-            start_str = self.format_time(int(start_sec*1000))
-            end_str = self.format_time(int(end_sec*1000))
-            if seg.get('gap'):
-                # GAP 行: JA/RU% を空欄にし TEXT に [GAP] を表示
-                start_item = QTableWidgetItem(start_str)
-                end_item = QTableWidgetItem(end_str)
-                ja_item = QTableWidgetItem("")
-                ru_item = QTableWidgetItem("")
-                text_item = QTableWidgetItem("[GAP]")
-                from PySide6.QtGui import QColor
-                # 視覚的に区別 (グレー)
-                gap_color = QColor(120,120,120)
-                text_item.setForeground(gap_color)
-                for it in (start_item, end_item, ja_item, ru_item):
-                    it.setTextAlignment(Qt.AlignCenter)
-                    it.setForeground(gap_color)
-                self.transcription_table.setItem(row, 0, start_item)
-                self.transcription_table.setItem(row, 1, end_item)
-                self.transcription_table.setItem(row, 2, ja_item)
-                self.transcription_table.setItem(row, 3, ru_item)
-                self.transcription_table.setItem(row, 4, text_item)
-                continue
-            ja_prob = seg.get("ja_prob", 0.0)
-            ru_prob = seg.get("ru_prob", 0.0)
-            text_ja = seg.get("text_ja", "")
-            text_ru = seg.get("text_ru", "")
-            # 表示テキストはユーザー選択言語を優先
-            chosen = seg.get('chosen_language')
-            if chosen == 'ja' and text_ja:
-                display_text = text_ja
-            elif chosen == 'ru' and text_ru:
-                display_text = text_ru
-            else:
-                display_text = text_ja if ja_prob >= ru_prob else text_ru
-            start_item = QTableWidgetItem(start_str)
-            end_item = QTableWidgetItem(end_str)
-            ja_item = QTableWidgetItem(f"{ja_prob:.2f}")
-            ru_item = QTableWidgetItem(f"{ru_prob:.2f}")
-            text_item = QTableWidgetItem(display_text)
-            for it in (start_item, end_item, ja_item, ru_item):
-                it.setTextAlignment(Qt.AlignCenter)
-            from PySide6.QtGui import QColor
-            if ja_prob >= ru_prob:
-                ja_item.setForeground(QColor(200,0,0))
-                ru_item.setForeground(QColor(0,0,180))
-            else:
-                ru_item.setForeground(QColor(200,0,0))
-                ja_item.setForeground(QColor(0,0,180))
-            self.transcription_table.setItem(row, 0, start_item)
-            self.transcription_table.setItem(row, 1, end_item)
-            self.transcription_table.setItem(row, 2, ja_item)
-            self.transcription_table.setItem(row, 3, ru_item)
-            self.transcription_table.setItem(row, 4, text_item)
+        if not result:
+            return
+        populate_table(self.transcription_table, result)
 
     def retranscribe_selected(self):
         """選択行を再文字起こし。
-        - 複数行(連続, 30秒以内, GAP無) → 結合して1行置換
-        - 単一行(非GAP) → その区間のみ再文字起こし
+    - 複数行(連続, 30秒以内) → 結合して1行置換
+    - 単一行 → その区間のみ再文字起こし
         """
         from PySide6.QtWidgets import QMessageBox, QApplication
         # ボタン押下で一時停止
@@ -1825,15 +1928,13 @@ class VideoTranscriptionApp(QMainWindow):
         rows_sorted = sorted(rows)
         if not rows_sorted:
             return
-        segs = self.transcription_result.get('segments', [])
+        segs = as_segment_list(self.transcription_result.get('segments', []))
         try:
             target = [segs[i] for i in rows_sorted]
         except IndexError:
             QMessageBox.critical(self, "エラー", "内部インデックス不整合")
             return
-        if any(s.get('gap') for s in target):
-            # GAP 行は許容: テキスト結合時は空文字として扱う
-            pass
+        # GAP 概念廃止: そのまま処理
         # 単一行モード
         if len(rows_sorted) == 1:
             idx = rows_sorted[0]
@@ -1881,21 +1982,39 @@ class VideoTranscriptionApp(QMainWindow):
                 self.range_retranscribing = False
                 self._rebuild_text_and_refresh()
                 self.status_label.setText("単一行再文字起こし失敗")
-            self.range_thread.finished.connect(single_finished)
+            self.range_thread.range_finished.connect(single_finished)
             self.range_thread.error.connect(single_error)
             self.range_thread.start()
             return
         # 複数行（従来処理）: 連続性 & 30秒以内チェック
-        for a,b in zip(rows_sorted, rows_sorted[1:]):
-            if b != a+1:
-                QMessageBox.critical(self, "エラー", "連続していない行が含まれています")
-                return
-        start_sec = float(target[0].get('start',0.0))
-        end_sec = float(target[-1].get('end', start_sec))
+        merged_list, insert_index, sec_range = merge_contiguous_segments(
+            self.transcription_result.get('segments', []), rows_sorted
+        )
+        if merged_list is None:
+            QMessageBox.critical(self, "エラー", "連続でない行や不正な範囲が含まれています")
+            return
+        start_sec, end_sec = sec_range
         if (end_sec - start_sec) > 30.0:
             QMessageBox.critical(self, "エラー", "選択範囲が30秒を超えています")
             return
-        # 非同期スレッドで部分再文字起こし
+        # セグメント差し替え（プレースホルダ）: 選択複数行を即時 1 行縮約
+        self.transcription_result['segments'] = merged_list
+        # 結合後の統合行へ [再解析中] プレースホルダ設定
+        try:
+            if 0 <= insert_index < len(self.transcription_result['segments']):
+                ph = self.transcription_result['segments'][insert_index]
+                ph['text'] = ph['text_ja'] = ph['text_ru'] = '[再解析中]'
+                ph['ja_prob'] = 0.0
+                ph['ru_prob'] = 0.0
+                ph['chosen_language'] = None
+        except Exception:
+            pass
+        # 行数変化を即時 UI へ反映
+        try:
+            self._rebuild_text_and_refresh()
+        except Exception:
+            pass
+        # 非同期スレッドで再文字起こし
         from transcriber import RangeTranscriptionThread
         model_size = self.model_combo.currentText()
         device = self.device_combo.currentText()
@@ -1909,7 +2028,8 @@ class VideoTranscriptionApp(QMainWindow):
         }
         self.status_label.setText("再文字起こし準備中...")
         self.progress_bar.setValue(0)
-        self.retranscribe_button.setEnabled(False)
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(False)
         if hasattr(self, 'partial_export_button'):
             self.partial_export_button.setEnabled(False)
         # フラグON (メニュー等を無効化)
@@ -1918,7 +2038,9 @@ class VideoTranscriptionApp(QMainWindow):
         self.range_thread = RangeTranscriptionThread(self.current_video_path, start_sec, end_sec, options)
         self.range_thread.progress.connect(self.on_range_progress)
         self.range_thread.status.connect(self.on_range_status)
-        self.range_thread.finished.connect(lambda seg, rows_sorted=rows_sorted, segs=segs: self.on_range_finished(seg, rows_sorted, segs))
+        # 完了時: placeholder 行 (merge 後の insert_index) を結果で置換。rows_sorted は元範囲参照用。
+        cb = lambda seg, rows_sorted=rows_sorted, orig_segs=segs: self.on_range_finished(seg, rows_sorted, orig_segs)
+        self.range_thread.range_finished.connect(cb)
         self.range_thread.error.connect(self.on_range_error)
         self.range_thread.start()
         # 後続処理はコールバックで行う
@@ -1956,17 +2078,14 @@ class VideoTranscriptionApp(QMainWindow):
         try:
             lines = []
             for s in new_segments:
-                if s.get('gap'):
-                    lines.append('[GAP]')
-                else:
-                    jp = s.get('ja_prob',0.0); rp = s.get('ru_prob',0.0)
-                    lines.append(s.get('text_ja','') if jp >= rp else s.get('text_ru',''))
+                lines.append(display_text(s))
             self.transcription_result['text'] = '\n'.join(lines)
         except Exception:
             pass
         self.display_transcription(self.transcription_result)
         self.status_label.setText("再文字起こし完了")
-        self.retranscribe_button.setEnabled(True)
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(True)
         if hasattr(self, 'partial_export_button'):
             self.partial_export_button.setEnabled(True)
 
@@ -1977,7 +2096,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.range_retranscribing = False
         self.status_label.setText("再文字起こし失敗")
         QMessageBox.critical(self, "再文字起こし失敗", err)
-        self.retranscribe_button.setEnabled(True)
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(True)
         if hasattr(self, 'partial_export_button'):
             self.partial_export_button.setEnabled(True)
 
@@ -2005,22 +2125,14 @@ class VideoTranscriptionApp(QMainWindow):
         except IndexError:
             QMessageBox.critical(self, "部分書き出し", "内部インデックス不整合")
             return
-        # 範囲の開始終了秒（GAP も含め許容。必要なら除外可）
         start_sec = float(target[0].get('start', 0.0))
         end_sec = float(target[-1].get('end', start_sec))
         if end_sec <= start_sec:
             QMessageBox.critical(self, "部分書き出し", "時間範囲が不正です")
             return
-        # テキスト構築（GAP は [GAP] として同じロジック）
-        lines = []
-        for s in target:
-            if s.get('gap'):
-                lines.append('[GAP]')
-                continue
-            jp = s.get('ja_prob',0.0); rp = s.get('ru_prob',0.0)
-            lines.append(s.get('text_ja','') if jp >= rp else s.get('text_ru',''))
+        from utils.segment_utils import display_text
+        lines = [display_text(s) for s in target]
         text_out = '\n'.join(lines)
-        # 出力パス生成
         base_name = os.path.splitext(os.path.basename(self.current_video_path))[0]
         def ts(sec: float):
             h = int(sec // 3600); m = int((sec % 3600)//60); s = int(sec % 60)
@@ -2031,10 +2143,8 @@ class VideoTranscriptionApp(QMainWindow):
         os.makedirs(out_dir, exist_ok=True)
         wav_path = os.path.join(out_dir, f"{base_name}_{safe_start}_{safe_end}.wav")
         txt_path = os.path.join(out_dir, f"{base_name}_{safe_start}_{safe_end}.txt")
-        # 音声切り出し ffmpeg 実行 (既存と同様 subprocess 呼び出し)
         import subprocess, tempfile
         try:
-            # -ss / -to で範囲指定、単純抽出 (再エンコード: wav pcm_s16le)
             cmd = [
                 'ffmpeg','-y',
                 '-i', self.current_video_path,
@@ -2048,22 +2158,86 @@ class VideoTranscriptionApp(QMainWindow):
         except subprocess.CalledProcessError:
             QMessageBox.critical(self, "部分書き出し", "音声抽出に失敗しました (ffmpeg)")
             return
-        # テキスト保存
         try:
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write(text_out)
         except Exception as e:
             QMessageBox.critical(self, "部分書き出し", f"テキスト保存失敗: {e}")
             return
-        # ログとステータス
-        msg = f"部分書き出し完了: {os.path.basename(wav_path)}, {os.path.basename(txt_path)}"
-        self.status_label.setText(msg)
+        duration = end_sec - start_sec
+        pretty_start = f"{start_sec:,.3f}s"
+        pretty_end = f"{end_sec:,.3f}s"
+        seg_count = len(target)
+        # ログ/ダイアログでは絶対パスではなく相対パス表示（作業ディレクトリ基準）にする
+        try:
+            cwd = os.getcwd()
+            rel_wav = os.path.relpath(wav_path, cwd)
+            rel_txt = os.path.relpath(txt_path, cwd)
+        except Exception:
+            rel_wav = wav_path
+            rel_txt = txt_path
+        msg = (
+            "部分書き出しが完了しました\n"
+            "--------------------------------\n"
+            f" 対象行数 : {seg_count}\n"
+            f" 時間範囲 : {pretty_start} 〜 {pretty_end} (Δ {duration:.3f}s)\n"
+            f" 出力WAV : {rel_wav}\n"
+            f" 出力TXT : {rel_txt}\n"
+            "--------------------------------"
+        )
+        self.status_label.setText("部分書き出し完了")
         if hasattr(self, 'log_text'):
             self.log_text.append(msg)
-        QMessageBox.information(self, "部分書き出し", msg)
+        from PySide6.QtWidgets import QMessageBox as _QMB
+        _QMB.information(self, "部分書き出し", msg)
+
+    def delete_selected_segments(self):
+        """選択行のテキスト列のみ空にし再描画。"""
+        if getattr(self, 'range_retranscribing', False):
+            return
+        if not getattr(self, 'transcription_result', None):
+            return
+        segs = self.transcription_result.get('segments', [])
+        if not segs:
+            return
+        rows = self._collect_selected_rows()
+        if not rows:
+            return
+        changed = 0
+        for r in rows:
+            if 0 <= r < len(segs):
+                seg = segs[r]
+                if any(seg.get(k) for k in ('text','text_ja','text_ru')):
+                    seg['text'] = ''
+                    seg['text_ja'] = ''
+                    seg['text_ru'] = ''
+                    changed += 1
+        if changed == 0:
+            return
+        try:
+            from transcriber import rebuild_aggregate_text
+            rebuild_aggregate_text(self.transcription_result)
+        except Exception:
+            pass
+        try:
+            for r in rows:
+                if 0 <= r < self.transcription_table.rowCount():
+                    item = self.transcription_table.item(r, 4)
+                    if item is None:
+                        from PySide6.QtWidgets import QTableWidgetItem
+                        item = QTableWidgetItem('')
+                        self.transcription_table.setItem(r, 4, item)
+                    else:
+                        item.setText('')
+        except Exception:
+            self.display_transcription(self.transcription_result)
+        self.status_label.setText(f"{changed}行のテキストを消去しました")
+        if hasattr(self, 'delete_button'):
+            self.delete_button.setEnabled(False)
+        self._update_split_button_state()
 
     def export_transcription(self):
-        """認識結果をファイルに書き出す (json / txt / srt / jsonl)。デフォルトは json。"""
+        """認識結果をファイルに書き出す (json / txt / srt)。デフォルトは json。"""
         if not getattr(self, 'transcription_result', None):
             self.status_label.setText("書き出し対象がありません")
             return
@@ -2078,15 +2252,13 @@ class VideoTranscriptionApp(QMainWindow):
             self,
             "書き出しファイルを保存",
             default_name,
-            "JSON (*.json);;テキスト (*.txt);;SRT 字幕 (*.srt);;JSON Lines (*.jsonl)"
+            "JSON (*.json);;テキスト (*.txt);;SRT 字幕 (*.srt)"
         )
         if not file_path:
             return
         # フォーマット判定
         low = file_path.lower()
-        if selected_filter.startswith("JSON Lines") or low.endswith('.jsonl'):
-            fmt = 'jsonl'
-        elif selected_filter.startswith("SRT") or low.endswith('.srt'):
+        if selected_filter.startswith("SRT") or low.endswith('.srt'):
             fmt = 'srt'
         elif selected_filter.startswith("テキスト") or low.endswith('.txt'):
             fmt = 'txt'
@@ -2097,22 +2269,22 @@ class VideoTranscriptionApp(QMainWindow):
                 if not low.endswith('.json'):
                     file_path += '.json'
                 import json
-                data = {
-                    'video_path': self.current_video_path,
-                    'model': self.model_combo.currentText() if hasattr(self, 'model_combo') else None,
-                    'device': self.device_combo.currentText() if hasattr(self, 'device_combo') else None,
-                    'segments': self.transcription_result.get('segments', []),
-                }
+                payload = build_json_payload(
+                    self.transcription_result,
+                    {
+                        'video_path': self.current_video_path,
+                        'model': self.model_combo.currentText() if hasattr(self, 'model_combo') else None,
+                        'device': self.device_combo.currentText() if hasattr(self, 'device_combo') else None,
+                    }
+                )
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
             else:
-                text = self._build_export_text(fmt)
+                text = build_export_text(self.transcription_result, fmt)
                 if fmt == 'txt' and not low.endswith('.txt'):
                     file_path += '.txt'
                 elif fmt == 'srt' and not low.endswith('.srt'):
                     file_path += '.srt'
-                elif fmt == 'jsonl' and not low.endswith('.jsonl'):
-                    file_path += '.jsonl'
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(text)
             self.status_label.setText(f"書き出し完了: {file_path}")
@@ -2121,100 +2293,7 @@ class VideoTranscriptionApp(QMainWindow):
             QMessageBox.critical(self, "書き出しエラー", str(e))
             self.status_label.setText("書き出し失敗")
 
-    def _build_export_text(self, fmt: str) -> str:
-        result = self.transcription_result
-        if fmt == 'txt':
-            # 常に最新 segments から全文を再構築（内部 'text' フィールドには依存しない）
-            segments = result.get('segments', [])
-            lines = []
-            def fmt_ts(sec: float) -> str:
-                h = int(sec // 3600)
-                m = int((sec % 3600) // 60)
-                s_full = sec % 60
-                s = int(s_full)
-                ms = int((s_full - s) * 1000)
-                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-            for seg in segments:
-                if seg.get('gap'):
-                    st = float(seg.get('start', 0.0))
-                    ed = float(seg.get('end', 0.0))
-                    lines.append(f"[GAP {fmt_ts(st)} -> {fmt_ts(ed)}]")
-                    continue
-                st = float(seg.get('start', 0.0))
-                ed = float(seg.get('end', 0.0))
-                ja_prob = seg.get('ja_prob', 0.0)
-                ru_prob = seg.get('ru_prob', 0.0)
-                ja_text = seg.get('text_ja', '') or ''
-                ru_text = seg.get('text_ru', '') or ''
-                # 双方空ならスキップ
-                if not (ja_text or ru_text):
-                    continue
-                lines.append(
-                    f"[{fmt_ts(st)} -> {fmt_ts(ed)}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] "
-                    f"JA={ja_text} | RU={ru_text}"
-                )
-            return '\n'.join(lines)
-        segments = result.get('segments', [])
-        if fmt == 'srt':
-            def to_srt_timestamp(sec: float) -> str:
-                h = int(sec // 3600)
-                m = int((sec % 3600) // 60)
-                s = int(sec % 60)
-                ms = int((sec - int(sec)) * 1000)
-                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-            lines = []
-            n = 1
-            for seg in segments:
-                if seg.get('gap'):
-                    continue
-                start = float(seg.get('start', 0.0))
-                end = float(seg.get('end', 0.0))
-                ja_prob = seg.get('ja_prob', 0.0)
-                ru_prob = seg.get('ru_prob', 0.0)
-                text_ja = seg.get('text_ja', '')
-                text_ru = seg.get('text_ru', '')
-                txt = text_ja if ja_prob >= ru_prob else text_ru
-                if not txt:
-                    continue
-                lines.append(f"{n}\n{to_srt_timestamp(start)} --> {to_srt_timestamp(end)}\n{txt}\n")
-                n += 1
-            return '\n'.join(lines)
-        if fmt == 'jsonl':
-            import json
-            rows = []
-            idx = 1
-            for seg in segments:
-                if seg.get('gap'):
-                    rows.append(json.dumps({
-                        'index': idx,
-                        'start': seg.get('start', 0.0),
-                        'end': seg.get('end', 0.0),
-                        'text': '[GAP]',
-                        'ja_prob': 0.0,
-                        'ru_prob': 0.0,
-                        'gap': True
-                    }, ensure_ascii=False))
-                    idx += 1
-                    continue
-                ja_prob = seg.get('ja_prob', 0.0)
-                ru_prob = seg.get('ru_prob', 0.0)
-                text_ja = seg.get('text_ja', '')
-                text_ru = seg.get('text_ru', '')
-                main_text = text_ja if ja_prob >= ru_prob else text_ru
-                rows.append(json.dumps({
-                    'index': idx,
-                    'start': seg.get('start', 0.0),
-                    'end': seg.get('end', 0.0),
-                    'text': main_text,
-                    'ja_prob': ja_prob,
-                    'ru_prob': ru_prob,
-                    'text_ja': text_ja,
-                    'text_ru': text_ru,
-                    'gap': False
-                }, ensure_ascii=False))
-                idx += 1
-            return '\n'.join(rows)
-        raise ValueError(f"未知の出力形式: {fmt}")
+    # _build_export_text: 外部 exporter.build_export_text へ移行済
 
     def play_pause(self):
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:
@@ -2247,7 +2326,7 @@ class VideoTranscriptionApp(QMainWindow):
 
     def position_changed(self, position):
         self.position_slider.setValue(position)
-        self.current_time_label.setText(self.format_time(position))
+        self.current_time_label.setText(format_ms(position))
         # 自動同期: チェックON かつ 再生中 のみ。ポーズ/停止中は固定。
         if getattr(self, 'auto_sync_check', None) and not self.auto_sync_check.isChecked():
             return
@@ -2262,45 +2341,15 @@ class VideoTranscriptionApp(QMainWindow):
 
     def duration_changed(self, duration):
         self.position_slider.setRange(0, duration)
-        self.total_time_label.setText(self.format_time(duration))
+        self.total_time_label.setText(format_ms(duration))
 
     def set_position(self, position):
         self.media_player.setPosition(position)
 
-    def format_time(self, milliseconds):
-        """ミリ秒 -> hh:mm:ss.mmm  (時間が0の場合でも hh を表示)"""
-        total_ms = int(milliseconds)
-        if total_ms < 0:
-            total_ms = 0
-        ms = total_ms % 1000
-        total_sec = total_ms // 1000
-        s = total_sec % 60
-        total_min = total_sec // 60
-        m = total_min % 60
-        h = total_min // 60
-        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-    def parse_time_to_ms(self, text: str) -> int:
-        """hh:mm:ss.mmm または mm:ss.mmm / mm:ss をミリ秒に。失敗時 0。"""
-        try:
-            if not text:
-                return 0
-            parts = text.split(':')
-            if len(parts) == 3:
-                h, m, rest = parts
-            elif len(parts) == 2:
-                h = '0'; m, rest = parts
-            else:
-                return 0
-            if '.' in rest:
-                s, ms = rest.split('.', 1)
-                ms = (ms + '000')[:3]  # 桁合わせ
-            else:
-                s = rest; ms = '000'
-            h = int(h); m = int(m); s = int(s); ms = int(ms)
-            return ((h*60 + m)*60 + s)*1000 + ms
-        except Exception:
-            return 0
+    # 旧 format_time / parse_time_to_ms は utils.timefmt の format_ms / parse_to_ms に統合
+    # 後方互換が必要なら以下のようにエイリアス化も可能
+    # format_time = staticmethod(format_ms)
+    # parse_time_to_ms = staticmethod(parse_to_ms)
 
 
 def main():

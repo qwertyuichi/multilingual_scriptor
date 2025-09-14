@@ -223,6 +223,7 @@ def advanced_process_video(
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
+    segment_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """動画を高度ルールで処理し GUI 互換の結果 dict を返す。
     戻り値: {'text': str, 'segments': [{'start','end','text','id'}], 'language': 'mixed'}
@@ -238,13 +239,17 @@ def advanced_process_video(
         selected_device = 'cpu'
     logger.info(f'[DEVICE] using device={selected_device}')
     load_kw = {'device': selected_device}
-    if status_callback:
-        status_callback('モデル読み込み中...')
+    # モデル読み込みステータスは呼び出し側(スレッド run)で統一表示するためここでは出さない
+    from transcriber import _load_cached_model
+    # メインモデルはキャッシュ経由（部分再文字起こしと共有）
+    model = _load_cached_model(model_size, selected_device)
     if segmentation_model_size:
-        seg_model = whisper.load_model(segmentation_model_size, **load_kw)
-        model = whisper.load_model(model_size, **load_kw)
+        if segmentation_model_size == model_size:
+            seg_model = model  # 同一サイズなら共有
+        else:
+            # セグメンテーション専用はキャッシュせず都度ロード (VRAM節約)
+            seg_model = whisper.load_model(segmentation_model_size, **load_kw)
     else:
-        model = whisper.load_model(model_size, **load_kw)
         seg_model = model
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_aud:
         audio_path = tmp_aud.name
@@ -270,7 +275,6 @@ def advanced_process_video(
         output_lines = []
         gui_segments = []
         srt_entries = []
-        jsonl_entries = []
         prev_end = 0.0
         idx = 0
         total_segments = len(initial_segments)
@@ -289,23 +293,6 @@ def advanced_process_video(
                 if (idx % step) == 0:
                     status_callback(f'文字起こし中... ({idx+1}/{total_segments})')
             st = seg['start']; ed = seg['end']  # 秒
-            gap = st - prev_end
-            if include_silent and gap >= gap_threshold and prev_end>0:
-                # テキスト出力用 GAP 行
-                output_lines.append(f"[GAP {gap:.2f}s]")
-                # GUI 表示用 GAP 疑似セグメント (音声無し区間)
-                gui_segments.append({
-                    'start': prev_end,
-                    'end': st,
-                    'text': '[GAP]',
-                    'text_ja': '',
-                    'text_ru': '',
-                    'chosen_language': 'gap',
-                    'id': f"gap-{idx}",  # 音声セグメントとは別扱い
-                    'ja_prob': 0.0,
-                    'ru_prob': 0.0,
-                    'gap': True,
-                })
             prev_end = ed
             start_sample = max(0, int(st * 16000))
             end_sample = min(len(full_audio), int(ed * 16000))
@@ -353,7 +340,7 @@ def advanced_process_video(
             ts_start, ts_end = fmt_ts(st), fmt_ts(ed)
             line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] JA={ja_text} | RU={ru_text}".strip()
             output_lines.append(line)
-            gui_segments.append({
+            seg_dict = {
                 'start': st,
                 'end': ed,
                 'text': seg_text,
@@ -363,25 +350,21 @@ def advanced_process_video(
                 'id': idx,
                 'ja_prob': ja_prob,
                 'ru_prob': ru_prob
-            })
-            # SRT/JSONL用
+            }
+            gui_segments.append(seg_dict)
+            if segment_callback:
+                # 逐次通知（GUI 側でテーブルへ追加）
+                try:
+                    segment_callback(seg_dict)
+                except Exception:
+                    pass
+            # SRT 用
             srt_entries.append((idx+1, st, ed, seg_text))
-            amb = abs(ja_prob - ru_prob) < ambiguous_threshold
-            jsonl_entries.append({
-                'index': idx+1,
-                'start': st,
-                'end': ed,
-                'text': seg_text,
-                'ja_prob': ja_prob,
-                'ru_prob': ru_prob,
-                'ambiguous': amb,
-                'language': detected_lang
-            })
             idx += 1
         if status_callback:
             status_callback('出力整形中...')
         full_text = '\n'.join(output_lines)
-        # SRT/JSONL出力対応
+        # SRT 出力対応
         if cancel_flag and cancel_flag():
             if status_callback:
                 status_callback('キャンセル完了 (部分結果)')
@@ -405,13 +388,6 @@ def advanced_process_video(
                 'segments': gui_segments,
                 'language': 'mixed'
             }
-        if output_format == 'jsonl':
-            import json
-            return {
-                'text': '\n'.join(json.dumps(e, ensure_ascii=False) for e in jsonl_entries),
-                'segments': gui_segments,
-                'language': 'mixed'
-            }
         return {'text': full_text, 'segments': gui_segments, 'language': 'mixed'}
     finally:
         if os.path.exists(audio_path):
@@ -424,6 +400,7 @@ class TranscriptionThread(QThread):
 
     progress = Signal(int)
     status = Signal(str)
+    segment_ready = Signal(dict)  # 逐次セグメント通知
     finished_transcription = Signal(dict)
     error = Signal(str)
 
@@ -442,8 +419,8 @@ class TranscriptionThread(QThread):
 
     def run(self) -> None:  # QThread 既定 run override
         try:
-            self.status.emit("モデルを読み込み中...")
-            self.progress.emit(10)
+            self.status.emit("文字起こし開始準備中...")
+            self.progress.emit(5)
             result = advanced_process_video(
                 self.video_path,
                 model_size=self.options.get('model', 'large-v3'),
@@ -463,6 +440,7 @@ class TranscriptionThread(QThread):
                 progress_callback=lambda p: self.progress.emit(p),
                 status_callback=lambda m: self.status.emit(m),
                 cancel_flag=self.is_cancelled,
+                segment_callback=lambda d: self.segment_ready.emit(d) if not self.is_cancelled() else None,
             )
             self.progress.emit(100)
             if self.is_cancelled():
@@ -480,7 +458,8 @@ class RangeTranscriptionThread(QThread):
     """部分選択再文字起こし専用スレッド。"""
     progress = Signal(int)
     status = Signal(str)
-    finished = Signal(dict)
+    # range_finished(dict): 再文字起こし完了シグナル（結果 dict を送出）
+    range_finished = Signal(dict)
     error = Signal(str)
 
     def __init__(self, video_path: str, start_sec: float, end_sec: float, options: dict):
@@ -506,7 +485,11 @@ class RangeTranscriptionThread(QThread):
             )
             self.progress.emit(100)
             self.status.emit('部分再文字起こし完了')
-            self.finished.emit(res)
+            # 完了結果シグナル送出
+            try:
+                self.range_finished.emit(res)
+            except Exception:
+                logger.exception('[ERROR] range_finished emit failed:')
         except Exception as e:
             logger.exception('[ERROR] RangeTranscriptionThread exception:')
             self.error.emit(str(e))
@@ -517,14 +500,42 @@ class RangeTranscriptionThread(QThread):
 # 部分区間 再文字起こしユーティリティ
 # =============================================================================================
 
-_MODEL_CACHE: dict[tuple[str,str], any] = {}
+from collections import OrderedDict
+
+# LRU 方式モデルキャッシュ (VRAM 常駐抑制のため上限 2)。
+_MODEL_CACHE_LIMIT = 2
+_MODEL_CACHE: 'OrderedDict[tuple[str,str], any]' = OrderedDict()
 
 def _load_cached_model(model_size: str, device: str):
+    """Whisper モデルを (model_size, device) キーで LRU キャッシュロード。
+
+    - 既存キー: 末尾へ移動し再利用
+    - 新規キー: 追加後、上限超過なら最古のものを削除し torch.cuda.empty_cache() でメモリ圧迫を軽減
+    """
     key = (model_size, device)
+    # 既存 -> LRU 更新
     if key in _MODEL_CACHE:
+        try:
+            _MODEL_CACHE.move_to_end(key)
+        except Exception:
+            pass
         return _MODEL_CACHE[key]
+    # 新規ロード
     m = whisper.load_model(model_size, device=device)
     _MODEL_CACHE[key] = m
+    # 上限管理 (古いものを解放)
+    if len(_MODEL_CACHE) > _MODEL_CACHE_LIMIT:
+        try:
+            old_key, old_model = _MODEL_CACHE.popitem(last=False)
+            # 明示削除 (参照カウントを下げる) → CUDA メモリキャッシュ解放
+            del old_model
+            if str(device).startswith('cuda') and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return m
 
 def transcribe_range(
@@ -604,6 +615,10 @@ def transcribe_range(
             status_callback('部分再文字起こし: 整形中...')
         if progress_callback:
             progress_callback(95)
+        try:
+            print(f"[DEBUG] range-result start={start_sec:.3f} end={end_sec:.3f} chosen={chosen} ja_prob={ja_prob:.3f} ru_prob={ru_prob:.3f} ja='{ja_text[:60]}' ru='{ru_text[:60]}'")
+        except Exception:
+            pass
         return {
             'start': start_sec,
             'end': end_sec,
