@@ -474,3 +474,149 @@ class TranscriptionThread(QThread):
             logger.exception("[ERROR] Transcription thread exception:")
             self.error.emit(str(e))
             self.status.emit("エラーが発生しました")
+
+
+class RangeTranscriptionThread(QThread):
+    """部分選択再文字起こし専用スレッド。"""
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, video_path: str, start_sec: float, end_sec: float, options: dict):
+        super().__init__()
+        self.video_path = video_path
+        self.start_sec = start_sec
+        self.end_sec = end_sec
+        self.options = options
+
+    def run(self):
+        try:
+            res = transcribe_range(
+                self.video_path,
+                self.start_sec,
+                self.end_sec,
+                model_size=self.options.get('model', 'large-v3'),
+                device=self.options.get('device'),
+                ja_weight=self.options.get('ja_weight', 1.0),
+                ru_weight=self.options.get('ru_weight', 1.0),
+                ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
+                progress_callback=lambda p: self.progress.emit(p),
+                status_callback=lambda m: self.status.emit(m),
+            )
+            self.progress.emit(100)
+            self.status.emit('部分再文字起こし完了')
+            self.finished.emit(res)
+        except Exception as e:
+            logger.exception('[ERROR] RangeTranscriptionThread exception:')
+            self.error.emit(str(e))
+            self.status.emit('部分再文字起こし失敗')
+
+
+# =============================================================================================
+# 部分区間 再文字起こしユーティリティ
+# =============================================================================================
+
+_MODEL_CACHE: dict[tuple[str,str], any] = {}
+
+def _load_cached_model(model_size: str, device: str):
+    key = (model_size, device)
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+    m = whisper.load_model(model_size, device=device)
+    _MODEL_CACHE[key] = m
+    return m
+
+def transcribe_range(
+    video_path: str,
+    start_sec: float,
+    end_sec: float,
+    model_size: str = 'large-v3',
+    device: str | None = None,
+    ja_weight: float = 1.0,
+    ru_weight: float = 1.0,
+    ambiguous_threshold: float = 10.0,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """動画ファイル中の指定秒区間 [start_sec, end_sec] を抽出し JA/RU 両言語で再文字起こし。
+
+    戻り値: {
+        'start': float, 'end': float,
+        'text': str, 'text_ja': str, 'text_ru': str,
+        'ja_prob': float, 'ru_prob': float,
+        'chosen_language': 'ja' | 'ru'
+    }
+    例外は呼び出し側で処理。
+    """
+    if end_sec <= start_sec:
+        raise ValueError('end_sec must be greater than start_sec')
+    dur = end_sec - start_sec
+    if dur > 30.0:
+        raise ValueError('選択区間が30秒を超えています')
+    if progress_callback:
+        progress_callback(5)
+    if status_callback:
+        status_callback('部分再文字起こし: モデル取得中...')
+    dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    model = _load_cached_model(model_size, dev)
+    # 一時 wav へ ffmpeg で切り出し (-accurate_seek を期待)
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_cut:
+        cut_path = tmp_cut.name
+    try:
+        if status_callback:
+            status_callback('部分再文字起こし: 区間抽出中...')
+        cmd = [
+            'ffmpeg', '-ss', f'{start_sec:.3f}', '-to', f'{end_sec:.3f}', '-i', video_path,
+            '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            '-y', cut_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        if progress_callback:
+            progress_callback(25)
+        audio_arr = whisper.load_audio(cut_path)
+        if audio_arr.size == 0:
+            raise RuntimeError('音声抽出に失敗しました')
+        if status_callback:
+            status_callback('部分再文字起こし: 言語判定中...')
+        detected_lang, ja_prob, ru_prob = _detect_lang_probs(model, audio_arr, ja_weight, ru_weight)
+        if progress_callback:
+            progress_callback(45)
+        if status_callback:
+            status_callback('部分再文字起こし: JA 推論中...')
+        ja_res = _transcribe_clip(model, audio_arr, 'ja')
+        if progress_callback:
+            progress_callback(65)
+        if status_callback:
+            status_callback('部分再文字起こし: RU 推論中...')
+        ru_res = _transcribe_clip(model, audio_arr, 'ru')
+        if progress_callback:
+            progress_callback(85)
+        ja_text = clean_hallucination(ja_res.get('text','').strip())
+        ru_text = clean_hallucination(ru_res.get('text','').strip())
+        if ja_prob >= ru_prob:
+            main_text = ja_text
+            chosen = 'ja'
+        else:
+            main_text = ru_text
+            chosen = 'ru'
+        if status_callback:
+            status_callback('部分再文字起こし: 整形中...')
+        if progress_callback:
+            progress_callback(95)
+        return {
+            'start': start_sec,
+            'end': end_sec,
+            'text': main_text,
+            'text_ja': ja_text,
+            'text_ru': ru_text,
+            'ja_prob': ja_prob,
+            'ru_prob': ru_prob,
+            'chosen_language': chosen,
+        }
+    finally:
+        if os.path.exists(cut_path):
+            try:
+                os.remove(cut_path)
+            except Exception:
+                pass

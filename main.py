@@ -254,11 +254,15 @@ class VideoTranscriptionApp(QMainWindow):
         self.position_slider.setRange(0, 0)
         control_layout.addWidget(self.position_slider)
 
-        # 時間ラベル
+        # 時間ラベル + 自動同期トグル
         time_layout = QHBoxLayout()
         self.current_time_label = QLabel("00:00")
         self.total_time_label = QLabel("00:00")
+        self.auto_sync_check = QCheckBox("自動同期")
+        self.auto_sync_check.setChecked(True)
+        self.auto_sync_check.setToolTip("再生中は現在位置に応じて行を自動選択します。停止/一時停止中は固定。")
         time_layout.addWidget(self.current_time_label)
+        time_layout.addWidget(self.auto_sync_check)
         time_layout.addStretch()
         time_layout.addWidget(self.total_time_label)
         control_layout.addLayout(time_layout)
@@ -290,10 +294,21 @@ class VideoTranscriptionApp(QMainWindow):
 
         left_layout.addLayout(control_layout)
 
-        # テーブル直前の右寄せエクスポートバー
+        # テーブル直前の右寄せエクスポートバー + 再文字起こしボタン
         export_bar = QHBoxLayout()
         export_bar.addStretch()
-        self.export_button = QPushButton("書き出し...")
+        self.retranscribe_button = QPushButton("選択結合再文字起こし")
+        self.retranscribe_button.setEnabled(False)
+        self.retranscribe_button.setToolTip("複数の連続行(合計30秒以内)を1文として再文字起こし")
+        self.retranscribe_button.clicked.connect(self.retranscribe_selected)
+        export_bar.addWidget(self.retranscribe_button)
+        # 部分書き出しボタン (選択行の音声+テキストを ./output へ出力)
+        self.partial_export_button = QPushButton("部分書き出し...")
+        self.partial_export_button.setEnabled(False)
+        self.partial_export_button.setToolTip("選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し")
+        self.partial_export_button.clicked.connect(self.partial_export_selected)
+        export_bar.addWidget(self.partial_export_button)
+        self.export_button = QPushButton("全文書き出し...")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self.export_transcription)
         export_bar.addWidget(self.export_button)
@@ -317,6 +332,10 @@ class VideoTranscriptionApp(QMainWindow):
         )
         self.transcription_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.transcription_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.transcription_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        # 右クリックコンテキストメニュー有効化
+        self.transcription_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.transcription_table.customContextMenuRequested.connect(self.show_table_context_menu)
         # 列幅・比率調整
         self.transcription_table.setColumnWidth(0, 80)  # START
         self.transcription_table.setColumnWidth(1, 80)  # END
@@ -705,6 +724,77 @@ class VideoTranscriptionApp(QMainWindow):
         # 言語チェックボックスのシグナル
         self.ja_check.stateChanged.connect(self.ensure_language_selected)
         self.ru_check.stateChanged.connect(self.ensure_language_selected)
+        # 自動同期トグル
+        if hasattr(self, 'auto_sync_check'):
+            self.auto_sync_check.toggled.connect(self.on_auto_sync_toggled)
+
+    def _collect_selected_rows(self):
+        rows = set()
+        for r in self.transcription_table.selectedRanges():
+            for i in range(r.topRow(), r.bottomRow()+1):
+                rows.add(i)
+        return sorted(rows)
+
+    def _can_retranscribe_selection(self, rows):
+        if not self.transcription_result or len(rows) < 2:
+            return False
+        segs = self.transcription_result.get('segments', [])
+        # 連続性 & GAP 無し & 30秒以内
+        try:
+            for a,b in zip(rows, rows[1:]):
+                if b != a+1:
+                    return False
+            target = [segs[i] for i in rows]
+        except Exception:
+            return False
+        if any(s.get('gap') for s in target):
+            return False
+        start_sec = float(target[0].get('start',0.0))
+        end_sec = float(target[-1].get('end', start_sec))
+        if (end_sec - start_sec) > 30.0:
+            return False
+        return True
+
+    def show_table_context_menu(self, pos):
+        if not getattr(self, 'transcription_result', None):
+            return
+        from PySide6.QtWidgets import QMenu
+        global_pos = self.transcription_table.viewport().mapToGlobal(pos)
+        # 右クリックした位置の行を追加選択（未選択ならその行を単一選択）
+        item = self.transcription_table.itemAt(pos)
+        if item:
+            row = item.row()
+            if row not in [i.row() for i in self.transcription_table.selectedItems()]:
+                self.transcription_table.selectRow(row)
+        rows = self._collect_selected_rows()
+        menu = QMenu(self)
+        act_re = menu.addAction("選択結合再文字起こし")
+        act_part = menu.addAction("部分書き出し")
+        # 可否判定
+        if not self._can_retranscribe_selection(rows):
+            act_re.setEnabled(False)
+        if not rows:
+            act_part.setEnabled(False)
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if chosen == act_re and act_re.isEnabled():
+            self.retranscribe_selected()
+        elif chosen == act_part and act_part.isEnabled():
+            self.partial_export_selected()
+
+    def on_auto_sync_toggled(self, checked: bool):
+        """自動同期トグル: ON かつ再生中なら即座に現在位置で同期する。"""
+        if not checked:
+            return
+        try:
+            if self.media_player.playbackState() == QMediaPlayer.PlayingState:
+                pos = self.media_player.position()
+                sel_model = self.transcription_table.selectionModel()
+                if sel_model and len(sel_model.selectedRows()) <= 1:
+                    self.sync_table_selection_with_position(pos)
+        except Exception:
+            pass
 
     def open_file(self):
         file_dialog = QFileDialog()
@@ -801,6 +891,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.transcribe_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.export_button.setEnabled(False)
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.status_label.setText("モデルを読み込み中...")
 
@@ -838,6 +930,10 @@ class VideoTranscriptionApp(QMainWindow):
         self.transcribe_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.export_button.setEnabled(True)
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(True)
+        if hasattr(self, 'partial_export_button'):
+            self.partial_export_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.status_label.setText("文字起こし完了")
 
@@ -849,6 +945,10 @@ class VideoTranscriptionApp(QMainWindow):
         self.transcribe_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.export_button.setEnabled(bool(getattr(self, 'transcription_result', None)))
+        if hasattr(self, 'retranscribe_button'):
+            self.retranscribe_button.setEnabled(bool(getattr(self, 'transcription_result', None)))
+        if hasattr(self, 'partial_export_button'):
+            self.partial_export_button.setEnabled(bool(getattr(self, 'transcription_result', None)))
         self.progress_bar.setValue(0)
 
     def cancel_transcription(self):
@@ -928,6 +1028,208 @@ class VideoTranscriptionApp(QMainWindow):
             self.transcription_table.setItem(row, 3, ru_item)
             self.transcription_table.setItem(row, 4, text_item)
 
+    def retranscribe_selected(self):
+        """選択された連続複数行(>=2, 30秒以内, GAP含まず)を結合して再文字起こしし1行に置換。"""
+        from PySide6.QtWidgets import QMessageBox, QApplication
+        # 要望: ボタン押下と同時に再生を一時停止して自動同期による選択移動を止める
+        try:
+            if self.media_player.playbackState() == QMediaPlayer.PlayingState:
+                self.media_player.pause()
+        except Exception:
+            pass
+        if not self.transcription_result:
+            return
+        ranges = self.transcription_table.selectedRanges()
+        if not ranges:
+            QMessageBox.warning(self, "再文字起こし", "行を選択してください")
+            return
+        rows = set()
+        for r in ranges:
+            for i in range(r.topRow(), r.bottomRow()+1):
+                rows.add(i)
+        if len(rows) < 2:
+            QMessageBox.warning(self, "再文字起こし", "2行以上を選択してください")
+            return
+        rows_sorted = sorted(rows)
+        for a,b in zip(rows_sorted, rows_sorted[1:]):
+            if b != a+1:
+                QMessageBox.critical(self, "エラー", "連続していない行が含まれています")
+                return
+        segs = self.transcription_result.get('segments', [])
+        try:
+            target = [segs[i] for i in rows_sorted]
+        except IndexError:
+            QMessageBox.critical(self, "エラー", "内部インデックス不整合")
+            return
+        if any(s.get('gap') for s in target):
+            QMessageBox.critical(self, "エラー", "GAP 行は含められません")
+            return
+        start_sec = float(target[0].get('start',0.0))
+        end_sec = float(target[-1].get('end', start_sec))
+        if (end_sec - start_sec) > 30.0:
+            QMessageBox.critical(self, "エラー", "選択範囲が30秒を超えています")
+            return
+        # 非同期スレッドで部分再文字起こし
+        from transcriber import RangeTranscriptionThread
+        model_size = self.model_combo.currentText()
+        device = self.device_combo.currentText()
+        ja_w = self.ja_weight_slider.value()/100.0
+        ru_w = self.ru_weight_slider.value()/100.0
+        options = {
+            'model': model_size,
+            'device': device,
+            'ja_weight': ja_w,
+            'ru_weight': ru_w,
+        }
+        self.status_label.setText("再文字起こし準備中...")
+        self.progress_bar.setValue(0)
+        self.retranscribe_button.setEnabled(False)
+        if hasattr(self, 'partial_export_button'):
+            self.partial_export_button.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.range_thread = RangeTranscriptionThread(self.current_video_path, start_sec, end_sec, options)
+        self.range_thread.progress.connect(self.on_range_progress)
+        self.range_thread.status.connect(self.on_range_status)
+        self.range_thread.finished.connect(lambda seg, rows_sorted=rows_sorted, segs=segs: self.on_range_finished(seg, rows_sorted, segs))
+        self.range_thread.error.connect(self.on_range_error)
+        self.range_thread.start()
+        # 後続処理はコールバックで行う
+        return
+    def on_range_progress(self, value: int):
+        self.progress_bar.setValue(value)
+
+    def on_range_status(self, message: str):
+        self.status_label.setText(message)
+        if hasattr(self, 'log_text'):
+            self.log_text.append(message)
+            if self.log_text.isVisible():
+                self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    def on_range_finished(self, new_seg: dict, rows_sorted: list[int], segs: list[dict]):
+        from PySide6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        new_segments = []
+        first = rows_sorted[0]
+        for idx, s in enumerate(segs):
+            if idx == first:
+                new_segments.append({
+                    'start': new_seg['start'], 'end': new_seg['end'],
+                    'text': new_seg['text'], 'text_ja': new_seg['text_ja'], 'text_ru': new_seg['text_ru'],
+                    'chosen_language': new_seg['chosen_language'], 'id': s.get('id', idx),
+                    'ja_prob': new_seg['ja_prob'], 'ru_prob': new_seg['ru_prob']
+                })
+            elif idx in rows_sorted[1:]:
+                continue
+            else:
+                new_segments.append(s)
+        self.transcription_result['segments'] = new_segments
+        try:
+            lines = []
+            for s in new_segments:
+                if s.get('gap'):
+                    lines.append('[GAP]')
+                else:
+                    jp = s.get('ja_prob',0.0); rp = s.get('ru_prob',0.0)
+                    lines.append(s.get('text_ja','') if jp >= rp else s.get('text_ru',''))
+            self.transcription_result['text'] = '\n'.join(lines)
+        except Exception:
+            pass
+        self.display_transcription(self.transcription_result)
+        self.status_label.setText("再文字起こし完了")
+        self.retranscribe_button.setEnabled(True)
+        if hasattr(self, 'partial_export_button'):
+            self.partial_export_button.setEnabled(True)
+
+    def on_range_error(self, err: str):
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        QApplication.restoreOverrideCursor()
+        self.status_label.setText("再文字起こし失敗")
+        QMessageBox.critical(self, "再文字起こし失敗", err)
+        self.retranscribe_button.setEnabled(True)
+        if hasattr(self, 'partial_export_button'):
+            self.partial_export_button.setEnabled(True)
+
+    def partial_export_selected(self):
+        """選択された行範囲の音声をWAV、テキストをTXTとして ./output に保存。ファイル名: 動画ベース_START_END"""
+        from PySide6.QtWidgets import QMessageBox
+        if not self.transcription_result or not self.current_video_path:
+            QMessageBox.warning(self, "部分書き出し", "書き出し対象がありません")
+            return
+        ranges = self.transcription_table.selectedRanges()
+        if not ranges:
+            QMessageBox.warning(self, "部分書き出し", "行を選択してください")
+            return
+        rows = set()
+        for r in ranges:
+            for i in range(r.topRow(), r.bottomRow()+1):
+                rows.add(i)
+        rows = sorted(rows)
+        if not rows:
+            QMessageBox.warning(self, "部分書き出し", "行を選択してください")
+            return
+        segs = self.transcription_result.get('segments', [])
+        try:
+            target = [segs[i] for i in rows]
+        except IndexError:
+            QMessageBox.critical(self, "部分書き出し", "内部インデックス不整合")
+            return
+        # 範囲の開始終了秒（GAP も含め許容。必要なら除外可）
+        start_sec = float(target[0].get('start', 0.0))
+        end_sec = float(target[-1].get('end', start_sec))
+        if end_sec <= start_sec:
+            QMessageBox.critical(self, "部分書き出し", "時間範囲が不正です")
+            return
+        # テキスト構築（GAP は [GAP] として同じロジック）
+        lines = []
+        for s in target:
+            if s.get('gap'):
+                lines.append('[GAP]')
+                continue
+            jp = s.get('ja_prob',0.0); rp = s.get('ru_prob',0.0)
+            lines.append(s.get('text_ja','') if jp >= rp else s.get('text_ru',''))
+        text_out = '\n'.join(lines)
+        # 出力パス生成
+        base_name = os.path.splitext(os.path.basename(self.current_video_path))[0]
+        def ts(sec: float):
+            h = int(sec // 3600); m = int((sec % 3600)//60); s = int(sec % 60)
+            return f"{h:02d}{m:02d}{s:02d}"
+        safe_start = ts(start_sec)
+        safe_end = ts(end_sec)
+        out_dir = os.path.join(os.path.dirname(__file__), 'output')
+        os.makedirs(out_dir, exist_ok=True)
+        wav_path = os.path.join(out_dir, f"{base_name}_{safe_start}_{safe_end}.wav")
+        txt_path = os.path.join(out_dir, f"{base_name}_{safe_start}_{safe_end}.txt")
+        # 音声切り出し ffmpeg 実行 (既存と同様 subprocess 呼び出し)
+        import subprocess, tempfile
+        try:
+            # -ss / -to で範囲指定、単純抽出 (再エンコード: wav pcm_s16le)
+            cmd = [
+                'ffmpeg','-y',
+                '-i', self.current_video_path,
+                '-ss', f"{start_sec:.3f}",
+                '-to', f"{end_sec:.3f}",
+                '-vn',
+                '-acodec','pcm_s16le','-ar','16000','-ac','1',
+                wav_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except subprocess.CalledProcessError:
+            QMessageBox.critical(self, "部分書き出し", "音声抽出に失敗しました (ffmpeg)")
+            return
+        # テキスト保存
+        try:
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(text_out)
+        except Exception as e:
+            QMessageBox.critical(self, "部分書き出し", f"テキスト保存失敗: {e}")
+            return
+        # ログとステータス
+        msg = f"部分書き出し完了: {os.path.basename(wav_path)}, {os.path.basename(txt_path)}"
+        self.status_label.setText(msg)
+        if hasattr(self, 'log_text'):
+            self.log_text.append(msg)
+        QMessageBox.information(self, "部分書き出し", msg)
+
     def export_transcription(self):
         """認識結果をファイルに書き出す (txt / srt / jsonl)。"""
         if not getattr(self, 'transcription_result', None):
@@ -973,7 +1275,36 @@ class VideoTranscriptionApp(QMainWindow):
     def _build_export_text(self, fmt: str) -> str:
         result = self.transcription_result
         if fmt == 'txt':
-            return result.get('text', '')
+            # 常に最新 segments から全文を再構築（内部 'text' フィールドには依存しない）
+            segments = result.get('segments', [])
+            lines = []
+            def fmt_ts(sec: float) -> str:
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                s_full = sec % 60
+                s = int(s_full)
+                ms = int((s_full - s) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+            for seg in segments:
+                if seg.get('gap'):
+                    st = float(seg.get('start', 0.0))
+                    ed = float(seg.get('end', 0.0))
+                    lines.append(f"[GAP {fmt_ts(st)} -> {fmt_ts(ed)}]")
+                    continue
+                st = float(seg.get('start', 0.0))
+                ed = float(seg.get('end', 0.0))
+                ja_prob = seg.get('ja_prob', 0.0)
+                ru_prob = seg.get('ru_prob', 0.0)
+                ja_text = seg.get('text_ja', '') or ''
+                ru_text = seg.get('text_ru', '') or ''
+                # 双方空ならスキップ
+                if not (ja_text or ru_text):
+                    continue
+                lines.append(
+                    f"[{fmt_ts(st)} -> {fmt_ts(ed)}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] "
+                    f"JA={ja_text} | RU={ru_text}"
+                )
+            return '\n'.join(lines)
         segments = result.get('segments', [])
         if fmt == 'srt':
             def to_srt_timestamp(sec: float) -> str:
@@ -1054,6 +1385,17 @@ class VideoTranscriptionApp(QMainWindow):
     def position_changed(self, position):
         self.position_slider.setValue(position)
         self.current_time_label.setText(self.format_time(position))
+        # 自動同期: チェックON かつ 再生中 のみ。ポーズ/停止中は固定。
+        if getattr(self, 'auto_sync_check', None) and not self.auto_sync_check.isChecked():
+            return
+        if self.media_player.playbackState() != QMediaPlayer.PlayingState:
+            return
+        try:
+            sel_model = self.transcription_table.selectionModel()
+            if sel_model and len(sel_model.selectedRows()) <= 1:
+                self.sync_table_selection_with_position(position)
+        except Exception:
+            pass
 
     def duration_changed(self, duration):
         self.position_slider.setRange(0, duration)
