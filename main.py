@@ -67,6 +67,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.transcription_thread = None
         self.current_video_path = None
         self.transcription_result = None
+        # 部分(結合)再文字起こし進行中フラグ
+        self.range_retranscribing = False
 
         # 設定ロード
         try:
@@ -297,7 +299,7 @@ class VideoTranscriptionApp(QMainWindow):
         # テーブル直前の右寄せエクスポートバー + 再文字起こしボタン
         export_bar = QHBoxLayout()
         export_bar.addStretch()
-        self.retranscribe_button = QPushButton("選択結合再文字起こし")
+        self.retranscribe_button = QPushButton("結合＆再文字起こし")
         self.retranscribe_button.setEnabled(False)
         self.retranscribe_button.setToolTip("複数の連続行(合計30秒以内)を1文として再文字起こし")
         self.retranscribe_button.clicked.connect(self.retranscribe_selected)
@@ -760,6 +762,15 @@ class VideoTranscriptionApp(QMainWindow):
             return
         from PySide6.QtWidgets import QMenu
         global_pos = self.transcription_table.viewport().mapToGlobal(pos)
+        # 進行中ならメニューは表示するが操作不可
+        if getattr(self, 'range_retranscribing', False):
+            menu = QMenu(self)
+            act_re = menu.addAction("結合＆再文字起こし")
+            act_part = menu.addAction("部分書き出し")
+            act_re.setEnabled(False)
+            act_part.setEnabled(False)
+            menu.exec(global_pos)
+            return
         # 右クリックした位置の行を追加選択（未選択ならその行を単一選択）
         item = self.transcription_table.itemAt(pos)
         if item:
@@ -768,7 +779,7 @@ class VideoTranscriptionApp(QMainWindow):
                 self.transcription_table.selectRow(row)
         rows = self._collect_selected_rows()
         menu = QMenu(self)
-        act_re = menu.addAction("選択結合再文字起こし")
+        act_re = menu.addAction("結合＆再文字起こし")
         act_part = menu.addAction("部分書き出し")
         # 可否判定
         if not self._can_retranscribe_selection(rows):
@@ -1086,6 +1097,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.retranscribe_button.setEnabled(False)
         if hasattr(self, 'partial_export_button'):
             self.partial_export_button.setEnabled(False)
+        # フラグON (メニュー等を無効化)
+        self.range_retranscribing = True
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.range_thread = RangeTranscriptionThread(self.current_video_path, start_sec, end_sec, options)
         self.range_thread.progress.connect(self.on_range_progress)
@@ -1108,6 +1121,8 @@ class VideoTranscriptionApp(QMainWindow):
     def on_range_finished(self, new_seg: dict, rows_sorted: list[int], segs: list[dict]):
         from PySide6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
+        # フラグ解除
+        self.range_retranscribing = False
         new_segments = []
         first = rows_sorted[0]
         for idx, s in enumerate(segs):
@@ -1143,6 +1158,8 @@ class VideoTranscriptionApp(QMainWindow):
     def on_range_error(self, err: str):
         from PySide6.QtWidgets import QApplication, QMessageBox
         QApplication.restoreOverrideCursor()
+        # フラグ解除
+        self.range_retranscribing = False
         self.status_label.setText("再文字起こし失敗")
         QMessageBox.critical(self, "再文字起こし失敗", err)
         self.retranscribe_button.setEnabled(True)
