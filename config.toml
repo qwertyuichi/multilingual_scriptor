@@ -28,7 +28,7 @@
     # srt_max_line: SRT 化する際の最大行数目安
     srt_max_line = 50
     # output_format: 出力形式候補 "txt" / "srt" / "json"
-    output_format = "txt"
+    output_format = "json"
     # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
     initial_prompt = ""
 
@@ -62,7 +62,7 @@
     # srt_max_line: SRT 化する際の最大行数目安
     srt_max_line = 50
     # output_format: 出力形式候補 "txt" / "srt" / "json"
-    output_format = "txt"
+    output_format = "json"
     # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
     initial_prompt = "風見カプラ Всем Привет Казами Капра"
 
