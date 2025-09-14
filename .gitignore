@@ -47,4 +47,4 @@ whisper_cache/
 *.txt
 
 # 明示的に追跡したい特定ファイルがある場合は ! で除外解除する (例)
-#!video/sample_keep.mp4
+!sample/*
