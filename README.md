@@ -160,6 +160,63 @@ initial_prompt = ""
 | JSON が空 (segments が 0) | セグメントが GAP のみ / 全て除外 | GAP 変換し過ぎていないか確認 |
 
 ---
+### 11.1 詳細診断ガイド (ログ/再トランスクリプト監視)
+
+恒久修正フェーズで導入されたロギング & デバッグ支援機能の使い方です。
+
+#### (A) ロギング有効化
+`config.toml` に任意で `[logging]` セクションを追加:
+```toml
+[logging]
+level = "DEBUG"          # INFO 以上を推奨。差分調査時のみ DEBUG
+file_enabled = true       # ファイル出力を有効化
+file_path = "app.log"     # 出力ファイルパス
+max_bytes = 1048576       # ローテーション閾値
+backup_count = 3          # 世代数
+```
+
+#### (B) セグメント再構築差分 (rebuild diff) 追跡
+`config.toml` に `[debug]` セクションを追加し `rebuild_diff = true` を設定すると、
+テーブル再描画時のセグメント配列差分が DEBUG ログに出力されます。
+```toml
+[debug]
+rebuild_diff = true
+```
+出力例:
+```
+12:34:56 [DEBUG] main: [DIFF][rebuild] +0 -0 modified=1
+12:34:56 [DEBUG] main: [DIFF][detail] row 12: end:14.32->14.56, text_ja:旧->新
+```
+意味:
+- `+N` 追加行数 / `-N` 削除行数
+- `modified=M` 変更行 (最大 10 行まで詳細)
+- `row i:` start / end / text_ja / text_ru / lang の差分一覧
+
+#### (C) 分割/結合再文字起こし監視 (ウォッチドッグ)
+`[再解析中]` プレースホルダが既定 (15 秒) 超えて残る場合は内部ウォッチドッグがチェックします。
+DEBUG ログで以下を追跡:
+1. プレースホルダ化された行数
+2. 対応 RangeTranscriptionThread の開始/完了 (今後詳細ログ追加予定)
+3. 完了後 `[DIFF][rebuild]` が出力され差分が反映されるか
+
+#### (D) 代表的な調査シナリオ
+| 症状 | チェック | 次アクション |
+|------|----------|--------------|
+| プレースホルダ残留 | `[DIFF][rebuild]` 無 | スレッド未完了/例外。例外ログ確認 |
+| 行数異常 | `+N -M` 値 | 分割/結合ロジック再確認 |
+| 時刻ズレ | detail 内 start/end 変化 | 丸め/境界調整計算確認 |
+| 言語ラベル不更新 | lang 差分欠落 | 言語確率再計算未実施 (transcriber範囲) |
+
+#### (E) 運用戻し (ログ抑制)
+1. `[logging].level = "INFO"`
+2. `[debug]` セクション削除または `rebuild_diff = false`
+3. 既存ログはローテーション設定で整理
+
+#### (F) 既知制限
+- 差分詳細は最大 10 行。大量一括更新はサマリのみ。
+- 行番号ベース比較のため再並び替えが起きた場合、差分解釈が困難になる可能性 (将来 ID 比較検討)。
+
+---
 ## 12. パフォーマンス & 改善余地
 - smaller モデル選択 / GPU 利用
 - faster-whisper (CTranslate2) 置換検討

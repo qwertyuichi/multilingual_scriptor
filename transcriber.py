@@ -501,9 +501,16 @@ class RangeTranscriptionThread(QThread):
 # =============================================================================================
 
 from collections import OrderedDict
+from constants import (
+    DEFAULT_MODEL_CACHE_LIMIT,
+    MAX_RANGE_SEC,
+)
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # LRU 方式モデルキャッシュ (VRAM 常駐抑制のため上限 2)。
-_MODEL_CACHE_LIMIT = 2
+_MODEL_CACHE_LIMIT = DEFAULT_MODEL_CACHE_LIMIT
 _MODEL_CACHE: 'OrderedDict[tuple[str,str], any]' = OrderedDict()
 
 def _load_cached_model(model_size: str, device: str):
@@ -563,8 +570,8 @@ def transcribe_range(
     if end_sec <= start_sec:
         raise ValueError('end_sec must be greater than start_sec')
     dur = end_sec - start_sec
-    if dur > 30.0:
-        raise ValueError('選択区間が30秒を超えています')
+    if dur > MAX_RANGE_SEC:
+        raise ValueError(f'選択区間が{MAX_RANGE_SEC:.0f}秒を超えています')
     if progress_callback:
         progress_callback(5)
     if status_callback:

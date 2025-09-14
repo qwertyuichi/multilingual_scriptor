@@ -1,4 +1,4 @@
-import sys
+import sys, os
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -28,10 +28,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QUrl, Slot, QLoggingCategory, QTimer
 import logging
+import tomllib as _toml
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from transcriber import TranscriptionThread
 from models.segment import Segment, as_segment_list
+from constants import (
+    PLACEHOLDER_PENDING,
+    DEFAULT_WATCHDOG_TIMEOUT_MS,
+    MIN_SEGMENT_DUR,
+    MAX_RANGE_SEC,
+)
 import torch
 from utils.timefmt import format_ms, parse_to_ms, to_srt_timestamp
 from utils.segment_utils import display_text, normalize_segment_id
@@ -39,6 +46,9 @@ from exporter import build_export_text, build_json_payload
 from ui.table_presenter import rebuild_aggregate_text, populate_table
 from services.segment_ops import split_segment_at_position, adjust_boundary
 from services.retranscribe_ops import dynamic_time_split, merge_contiguous_segments
+from logging_config import setup_logging, get_logger
+
+logger = get_logger(__name__)
 
 
 def get_whisper_model_names():
@@ -640,9 +650,9 @@ class VideoTranscriptionApp(QMainWindow):
             # 分割直後は旧テキスト断片を保持せず一旦空にしてプレースホルダ表示
             for segx in (front, back):
                 # プレースホルダ明示: 完了前でも UI/編集ダイアログでわかるようにする
-                segx['text'] = '[再解析中]'
-                segx['text_ja'] = '[再解析中]'
-                segx['text_ru'] = '[再解析中]'
+                segx['text'] = PLACEHOLDER_PENDING
+                segx['text_ja'] = PLACEHOLDER_PENDING
+                segx['text_ru'] = PLACEHOLDER_PENDING
                 segx['ja_prob'] = 0.0
                 segx['ru_prob'] = 0.0
                 # 言語未確定扱い（確定前に display_text が ja/ru の空文字優先で消えるのを防ぐ）
@@ -655,10 +665,10 @@ class VideoTranscriptionApp(QMainWindow):
                         from PySide6.QtWidgets import QTableWidgetItem
                         item = self.transcription_table.item(idx_tmp, 4)
                         if item is None:
-                            item = QTableWidgetItem('[再解析中]')
+                            item = QTableWidgetItem(PLACEHOLDER_PENDING)
                             self.transcription_table.setItem(idx_tmp, 4, item)
                         else:
-                            item.setText('[再解析中]')
+                            item.setText(PLACEHOLDER_PENDING)
             except Exception:
                 pass
             # 集約テキスト再構築
@@ -683,7 +693,7 @@ class VideoTranscriptionApp(QMainWindow):
                 self._split_watchdog_timer = _QTimer(self)
                 self._split_watchdog_timer.setSingleShot(True)
                 self._split_watchdog_timer.timeout.connect(self._check_split_watchdog)
-                self._split_watchdog_timer.start(15000)
+                self._split_watchdog_timer.start(DEFAULT_WATCHDOG_TIMEOUT_MS)
             except Exception:
                 pass
             self._run_next_split_rejob()
@@ -699,7 +709,7 @@ class VideoTranscriptionApp(QMainWindow):
             end = float(seg2.get('end', mid))
             if not (start < cur_sec < end):
                 return
-            MIN_DUR = 0.2
+            MIN_DUR = MIN_SEGMENT_DUR
             new_mid = cur_sec
             if new_mid - start < MIN_DUR or end - new_mid < MIN_DUR:
                 return
@@ -721,7 +731,7 @@ class VideoTranscriptionApp(QMainWindow):
                 self._split_watchdog_timer = _QTimer(self)
                 self._split_watchdog_timer.setSingleShot(True)
                 self._split_watchdog_timer.timeout.connect(self._check_split_watchdog)
-                self._split_watchdog_timer.start(15000)
+                self._split_watchdog_timer.start(DEFAULT_WATCHDOG_TIMEOUT_MS)
             except Exception:
                 pass
             self._run_next_split_rejob()
@@ -754,13 +764,30 @@ class VideoTranscriptionApp(QMainWindow):
             )
 
     def load_config(self):
-        """config.toml を読み込み。無ければエラーを送出。フォールバック挿入は行わない。"""
+        """config.toml を読み込み、logging セクションがあればロギングを初期化。"""
         cfg_path = os.path.join(os.path.dirname(__file__), "config.toml")
         if not os.path.exists(cfg_path):
             raise FileNotFoundError("config.toml not found.")
         try:
             with open(cfg_path, "rb") as f:
-                return _toml.load(f)
+                data = _toml.load(f)
+            # ロギング初期化 (一度のみ)
+            try:
+                log_conf = data.get('logging') if isinstance(data, dict) else None
+                setup_logging(log_conf)
+                logger.info("Logging initialized level=%s", (log_conf or {}).get('level','INFO'))
+            except Exception:
+                pass
+            # デバッグ設定 ([debug] セクション)
+            try:
+                dbg_conf = data.get('debug') if isinstance(data, dict) else None
+                self.debug_rebuild_diff = bool(dbg_conf.get('rebuild_diff', False)) if isinstance(dbg_conf, dict) else False
+            except Exception:
+                self.debug_rebuild_diff = False
+            # 初回スナップショット保持用
+            if not hasattr(self, '_last_segments_snapshot'):
+                self._last_segments_snapshot = []
+            return data
         except Exception as e:
             raise RuntimeError(f"Failed to load config.toml: {e}")
 
@@ -1451,8 +1478,57 @@ class VideoTranscriptionApp(QMainWindow):
         """
         try:
             from ui.table_presenter import rebuild_aggregate_text, populate_table
+
+            # 差分デバッグ用: 前回スナップショットと比較
+            debug_enabled = bool(getattr(self, 'debug_rebuild_diff', False))
+            prev_snapshot = getattr(self, '_last_segments_snapshot', []) if debug_enabled else None
+
+            if debug_enabled:
+                # スナップショット生成 (変更後を取得するため rebuild 前に segments をそのまま読む)
+                # rebuild_aggregate_text は segments の start/end/text_ja/text_ru を変更しない想定
+                # -> 変更は rebuild 呼び出し前の操作関数で完了している前提
+                pass
+
             rebuild_aggregate_text(self.transcription_result)
             populate_table(self.transcription_table, self.transcription_result)
+
+            if debug_enabled:
+                segs = self.transcription_result.get('segments', []) if self.transcription_result else []
+                cur_snapshot = [
+                    (
+                        round(float(s.get('start', 0.0)), 3),
+                        round(float(s.get('end', 0.0)), 3),
+                        s.get('text_ja') or '',
+                        s.get('text_ru') or '',
+                        s.get('chosen_language') or s.get('lang') or ''
+                    ) for s in segs
+                ]
+                if prev_snapshot is not None:
+                    # 行数増減
+                    added = len(cur_snapshot) - len(prev_snapshot) if len(cur_snapshot) >= len(prev_snapshot) else 0
+                    removed = len(prev_snapshot) - len(cur_snapshot) if len(prev_snapshot) > len(cur_snapshot) else 0
+                    changed_details = []
+                    for i, (old, new) in enumerate(zip(prev_snapshot, cur_snapshot)):
+                        if old != new:
+                            # 差分抽出 (start/end 変化 or text変化)
+                            diff_fields = []
+                            labels = ['start','end','text_ja','text_ru','lang']
+                            for idx_f, (o_f, n_f) in enumerate(zip(old, new)):
+                                if o_f != n_f:
+                                    diff_fields.append(f"{labels[idx_f]}:{o_f}->{n_f}")
+                            changed_details.append(f"row {i}: " + ", ".join(diff_fields))
+                            if len(changed_details) >= 10:
+                                changed_details.append("...(省略)...")
+                                break
+                    if added or removed or changed_details:
+                        logger.debug(
+                            "[DIFF][rebuild] +%d -%d modified=%d", added, removed, len(changed_details)
+                        )
+                        if changed_details:
+                            for line in changed_details:
+                                logger.debug("[DIFF][detail] %s", line)
+                # 更新
+                self._last_segments_snapshot = cur_snapshot
         except Exception:
             pass
 
@@ -1693,7 +1769,8 @@ class VideoTranscriptionApp(QMainWindow):
             for attr in ('seek_back_10_btn','seek_back_1_btn','seek_fwd_1_btn','seek_fwd_10_btn'):
                 if hasattr(self, attr):
                     getattr(self, attr).setEnabled(True)
-            self.setWindowTitle(f"動画文字起こしエディタ - {file_path}")
+            import os as _os
+            self.setWindowTitle(f"動画文字起こしエディタ - {_os.path.basename(file_path)}")
 
     def ensure_language_selected(self):
         # 状態変更イベントの連続発火で一時的に全チェックが外れることがあるため
