@@ -1,82 +1,60 @@
 [default]
-    # ===== 基本設定 (GUI: 基本設定グループ順) =====
-    # device: 使用するデバイス (cpu / cuda)
-    device = "cuda"
-    # transcription_model: 使用するメイン Whisper モデル名 (例: tiny, base, small, medium, large, large-v2, large-v3)
-    transcription_model = "large-v3"
-    # segmentation_model: セグメント分割用モデルサイズ (turbo / small など)。未調整なら "turbo" 推奨
-    segmentation_model = "turbo"
-    # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
-    default_languages = ["ja"]
+# ===== 基本設定 =====
+device = "cuda"                    # cpu / cuda / auto
+model = "large-v3"                 # large-v3 / distil-large-v3
+default_languages = ["ja"]         # 起動時に選択する言語
 
-    # ===== 言語ウェイト (GUI: 言語設定) =====
-    # ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
-    ja_weight = 1.00
-    ru_weight = 1.00
+# ===== 言語ウェイト =====
+ja_weight = 0.50                   # 日本語スコアの補正係数 (ja_weight + ru_weight = 1.0)
+ru_weight = 0.50                   # ロシア語スコアの補正係数 (ja_weight + ru_weight = 1.0)
 
-    # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
-    # min_seg_dur: 1セグメントの最小継続時間(秒)
-    min_seg_dur = 0.60
-    # silence_rms_threshold: これ未満の RMS (平均振幅) なら無音としてスキップ
-    silence_rms_threshold = 0.0045
-    # min_voice_ratio: VAD で音声と判定されたフレーム比率の下限 (0~1)。下回れば無音扱い
-    min_voice_ratio = 0.18
-    # max_silence_repeat: 低エネルギー条件 (RMS/voice_ratio 両方閾値以下) で
-    #   同一 (JA/RU 両方) テキストが連続で出た場合に許容する回数。
-    #   1=2回目で抑止。0=即抑止（推奨しない）。
-    max_silence_repeat = 1
-    # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
-    vad_level = 2
-    # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
-    gap_threshold = 0.5
-    # ambiguous_threshold: JA/RU スコア差がこの値未満なら両言語再トライ
-    ambiguous_threshold = 30.0
-    # include_silent: スキップ/無音情報を出力へ含めるか
-    include_silent = true
-    # srt_max_line: SRT 化する際の最大行数目安
-    srt_max_line = 50
-    # output_format: 出力形式候補 "txt" / "srt" / "json"
-    output_format = "json"
-    # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
-    initial_prompt = ""
+# ===== 文字起こし調整 =====
+no_speech_threshold = 0.6          # 無音スキップ感度: 0に近いほど無音と判定しにくい (0〜1)
+initial_prompt = ""                # 認識ヒント文: 固有名詞や話し方を書くと精度が上がる。空なら無効
+
+# ===== VAD (音声区間の自動検出) =====
+vad_filter = true                  # true=無音部分を自動でスキップ
+vad_threshold = 0.5                # 音声と判定する確率の下限: 高いほど厳格に音声を絞る (0〜1)
+vad_min_speech_ms = 250            # これより短い発話は除外 (ms)
+vad_min_silence_ms = 2000          # この長さ以上の無音をセグメント区切りとして扱う (ms)
+
 
 [kapra]
-    # ===== 基本設定 (GUI: 基本設定グループ順) =====
-    # device: 使用するデバイス (cpu / cuda)
-    device = "cuda"
-    # transcription_model: 使用するメイン Whisper モデル名 (例: tiny, base, small, medium, large, large-v2, large-v3)
-    transcription_model = "large-v3"
-    # segmentation_model: セグメント分割用モデルサイズ (turbo / small など)。未調整なら "turbo" 推奨
-    segmentation_model = "turbo"
-    # default_languages: 起動時にチェックしておく言語コード配列 (例: ["ja", "ru"])。最低1つは必須。
-    default_languages = ["ja", "ru"]
+device = "cuda"
+model = "large-v3"
+default_languages = ["ja", "ru"]
 
-    # ===== 言語ウェイト (GUI: 言語設定) =====
-    # ja_weight / ru_weight: 言語判定スコアに掛ける重み補正
-    ja_weight = 0.80
-    ru_weight = 1.25
+ja_weight = 0.4
+ru_weight = 0.6
 
-    # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
-    # min_seg_dur: 1セグメントの最小継続時間(秒)
-    min_seg_dur = 0.60
-    # silence_rms_threshold: これ未満の RMS (平均振幅) なら無音としてスキップ
-    silence_rms_threshold = 0.0045
-    # min_voice_ratio: VAD で音声と判定されたフレーム比率の下限 (0~1)。下回れば無音扱い
-    min_voice_ratio = 0.18
-    # max_silence_repeat: 低エネルギー条件 (RMS/voice_ratio 両方閾値以下) で同一テキストが連続したら抑止する許容回数
-    max_silence_repeat = 1
-    # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
-    vad_level = 2
-    # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
-    gap_threshold = 0.5
-    # ambiguous_threshold: JA/RU スコア差がこの値未満なら両言語再トライ
-    ambiguous_threshold = 30.0
-    # include_silent: スキップ/無音情報を出力へ含めるか
-    include_silent = true
-    # srt_max_line: SRT 化する際の最大行数目安
-    srt_max_line = 50
-    # output_format: 出力形式候補 "txt" / "srt" / "json"
-    output_format = "json"
-    # initial_prompt: 文字起こしの初期プロンプト (オプション、空文字で無効)
-    initial_prompt = "風見カプラ Всем Привет Казами Капра"
+no_speech_threshold = 0.6
+initial_prompt = "風見カプラ Всем Привет Казами Капра"
+
+vad_filter = true
+vad_threshold = 0.5
+vad_min_speech_ms = 250
+vad_min_silence_ms = 500           # 発話テンポが速い配信に合わせて短め
+
+
+[hidden]
+# ================================================================
+# GUI には表示されない上級者向けパラメータ。
+# config.toml を直接編集することで調整可能。全プロファイル共通。
+# ================================================================
+
+# ---- Beam Size 詳細設定 ----
+phase1_beam_size = 5
+phase2_detect_beam_size = 1
+phase2_retranscribe_beam_size = 5
+
+# ---- 言語判定 ----
+ambiguous_threshold = 50.0
+
+# ---- その他 ----
+condition_on_previous_text = true
+compression_ratio_threshold = 2.4
+log_prob_threshold = -1.0
+repetition_penalty = 1.0
+speech_pad_ms = 400
+duplicate_merge = true
 

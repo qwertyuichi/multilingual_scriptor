@@ -31,6 +31,7 @@ class TranscriptionThread(QThread):
     segment_ready = Signal(dict)
     finished_transcription = Signal(dict)
     error = Signal(str)
+    device_fallback_warning = Signal()
 
     def __init__(self, video_path: str, options: dict):
         super().__init__()
@@ -52,24 +53,24 @@ class TranscriptionThread(QThread):
             result = advanced_process_video(
                 self.video_path,
                 model_size=self.options.get('model', 'large-v3'),
-                segmentation_model_size=self.options.get('segmentation_model_size', 'turbo'),
-                seg_mode=self.options.get('seg_mode', 'hybrid'),
                 device=self.options.get('device'),
-                ja_weight=self.options.get('ja_weight', 0.80),
-                ru_weight=self.options.get('ru_weight', 1.25),
-                min_seg_dur=self.options.get('min_seg_dur', 0.60),
-                ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
-                vad_level=self.options.get('vad_level', 2),
-                gap_threshold=self.options.get('gap_threshold', 0.5),
-                output_format=self.options.get('output_format', 'txt'),
-                srt_max_line=self.options.get('srt_max_line', 50),
-                include_silent=self.options.get('include_silent', False),
-                debug=self.options.get('debug_segments', False),
+                languages=self.options.get('languages', ['ja']),
+                ja_weight=self.options.get('ja_weight', 1.0),
+                ru_weight=self.options.get('ru_weight', 1.0),
+                beam_size=self.options.get('beam_size', 5),
+                no_speech_threshold=self.options.get('no_speech_threshold', 0.6),
+                initial_prompt=self.options.get('initial_prompt') or None,
+                vad_filter=self.options.get('vad_filter', True),
+                vad_threshold=self.options.get('vad_threshold', 0.5),
+                vad_min_speech_ms=self.options.get('vad_min_speech_ms', 250),
+                vad_min_silence_ms=self.options.get('vad_min_silence_ms', 2000),
+                ambiguous_threshold=self.options.get('ambiguous_threshold', 30.0),
+                condition_on_previous_text=self.options.get('condition_on_previous_text', True),
+                compression_ratio_threshold=self.options.get('compression_ratio_threshold', 2.4),
+                log_prob_threshold=self.options.get('log_prob_threshold', -1.0),
+                repetition_penalty=self.options.get('repetition_penalty', 1.0),
+                speech_pad_ms=self.options.get('speech_pad_ms', 400),
                 duplicate_merge=self.options.get('duplicate_merge', True),
-                duplicate_debug=self.options.get('duplicate_debug', True),
-                silence_rms_threshold=self.options.get('silence_rms_threshold'),
-                min_voice_ratio=self.options.get('min_voice_ratio'),
-                max_silence_repeat=self.options.get('max_silence_repeat'),
                 progress_callback=lambda p: self.progress.emit(p),
                 status_callback=lambda m: self.status.emit(m),
                 cancel_flag=self.is_cancelled,
@@ -80,6 +81,11 @@ class TranscriptionThread(QThread):
                 self.status.emit("キャンセルされました")
             else:
                 self.status.emit("文字起こし完了")
+            
+            # デバイスフォールバック警告
+            if result.get('device_fallback', False):
+                self.device_fallback_warning.emit()
+            
             self.finished_transcription.emit(result)
         except Exception as e:
             logger.exception("[ERROR] TranscriptionThread exception:")
@@ -102,6 +108,7 @@ class RangeTranscriptionThread(QThread):
     status = Signal(str)
     range_finished = Signal(dict)
     error = Signal(str)
+    device_fallback_warning = Signal()
 
     def __init__(self, video_path: str, start_sec: float, end_sec: float, options: dict):
         super().__init__()
@@ -118,16 +125,22 @@ class RangeTranscriptionThread(QThread):
                 self.end_sec,
                 model_size=self.options.get('model', 'large-v3'),
                 device=self.options.get('device'),
+                languages=self.options.get('languages', ['ja']),
                 ja_weight=self.options.get('ja_weight', 1.0),
                 ru_weight=self.options.get('ru_weight', 1.0),
-                ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
+                beam_size=self.options.get('beam_size', 5),
+                no_speech_threshold=self.options.get('no_speech_threshold', 0.6),
+                condition_on_previous_text=self.options.get('condition_on_previous_text', False),
                 progress_callback=lambda p: self.progress.emit(p),
                 status_callback=lambda m: self.status.emit(m),
-                silence_rms_threshold=self.options.get('silence_rms_threshold'),
-                min_voice_ratio=self.options.get('min_voice_ratio'),
             )
             self.progress.emit(100)
             self.status.emit('部分再文字起こし完了')
+            
+            # デバイスフォールバック警告
+            if res.get('device_fallback', False):
+                self.device_fallback_warning.emit()
+            
             self.range_finished.emit(res)
         except Exception as e:
             logger.exception('[ERROR] RangeTranscriptionThread exception:')

@@ -7,12 +7,8 @@ from __future__ import annotations
 
 # 利用可能な Whisper 公式モデル名一覧 (UI コンボボックス用)
 WHISPER_MODELS: list[str] = [
-    "tiny",
-    "base",
-    "small",
-    "medium",
     "large-v3",
-    "turbo",
+    "distil-large-v3",
 ]
 
 # プレースホルダ表示用テキスト
@@ -47,12 +43,4 @@ __all__ = [
     "DUP_MERGE_MAX_GAP",
     "MAX_RANGE_SEC",
     "DEFAULT_MODEL_CACHE_LIMIT",
-    "DEFAULT_SILENCE_RMS_THRESHOLD",
-    "DEFAULT_MIN_VOICE_RATIO",
-    "DEFAULT_MAX_SILENCE_REPEAT",
 ]
-
-# 無音抑制関連デフォルト値（config.toml で上書き可）
-DEFAULT_SILENCE_RMS_THRESHOLD = 0.0045  # これ未満ならエネルギー的に無音扱い
-DEFAULT_MIN_VOICE_RATIO = 0.18          # VAD voiced フレーム比の下限
-DEFAULT_MAX_SILENCE_REPEAT = 1          # 低エネルギー条件下で同一テキストを許容する最大回数

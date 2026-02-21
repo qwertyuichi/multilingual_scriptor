@@ -1,8 +1,10 @@
 <br>
 
-# 動画文字起こし & セグメント編集 GUI (日露中心)
+# Multilingual Scriptor
 
-Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シーク」「セグメント編集 (分割/結合/境界調整)」「部分再トランスクリプト」「書き出し (TXT / SRT / JSON)」を行うデスクトップツールです。日本語とロシア語を主対象に確率 (JA / RU) を保持しつつ編集できます。
+**多言語対応動画文字起こし & セグメント編集 GUI**
+
+Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シーク」「セグメント編集 (分割/結合/境界調整)」「部分再トランスクリプト」「書き出し (TXT / SRT / JSON)」を行うデスクトップツールです。複数言語の確率を保持しながら編集でき、日本語・ロシア語をはじめとした多言語コンテンツに対応します。
 
 ---
 ## 1. 主な特徴
@@ -28,7 +30,7 @@ Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シ�
 ### 3.1 前提
 - Python 3.11+ 推奨 (標準 `tomllib` 利用)
 - FFmpeg (PATH 通し済み)
-- (任意) CUDA 対応 GPU
+- (任意) CUDA 対応 GPU または AMD ROCm 対応 GPU
 
 ### 3.2 依存パッケージ
 `requirements.txt`:
@@ -53,6 +55,25 @@ FFmpeg 確認:
 ```pwsh
 ffmpeg -version
 ```
+
+### 3.3 AMD ROCm GPU を使用する場合
+
+`faster-whisper` の推論エンジンである **CTranslate2** は、AMD ROCm GPU 向けの公式 PyPI パッケージを提供していません。`pip install ctranslate2` でインストールされる標準ホイールは ROCm に対応していないため、**ROCm 専用ホイール**を別途入手してインストールする必要があります。
+
+> **CTranslate2 公式より:**
+> *"If you have an AMD ROCm GPU, we provide specific Python wheels on the [releases page](https://github.com/OpenNMT/CTranslate2/releases/)."*
+
+**インストール手順:**
+
+1. [CTranslate2 Releases](https://github.com/OpenNMT/CTranslate2/releases/) から自身の環境に合ったホイール (Python バージョン・OS・ROCm バージョン) をダウンロードする。
+2. 通常の `pip install -r requirements.txt` でその他の依存関係を先にインストールする。
+3. `ctranslate2` だけ手動でホイールを指定してインストールする:
+
+```pwsh
+pip install ctranslate2-X.Y.Z-cpXXX-cpXXX-*.whl --force-reinstall
+```
+
+> **注意:** ROCm 対応ホイールを `--force-reinstall` で上書きした後、`pip install faster-whisper` が `ctranslate2` を再度上書きしないよう注意してください。必要に応じて `faster-whisper` インストール後にホイールを再適用してください。
 
 ---
 ## 4. 起動

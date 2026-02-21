@@ -19,6 +19,9 @@ def display_text(seg: Dict[str, Any]) -> str:
         return ""
     if seg.get("gap"):
         return ""  # GAP は空文字表示
+    # 無音セグメントは「[無音]」と表示
+    if seg.get("chosen_language") == "silence":
+        return "[無音]"
     # プレースホルダ (再解析中) はそのまま表示
     for key in ('text', 'text_ja', 'text_ru'):
         v = seg.get(key)

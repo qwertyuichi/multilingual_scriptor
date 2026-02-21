@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Dict, Any
 from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from models.segment import as_segment_list
 from utils.timefmt import format_ms
 from utils.segment_utils import display_text
@@ -26,6 +27,28 @@ def rebuild_aggregate_text(result: Dict[str, Any]) -> None:
     # 反映
     result['segments'] = [s.to_dict() for s in segs]
     result['text'] = '\n'.join(lines)
+
+
+def apply_prob_colors(
+    table: QTableWidget,
+    ja_item: QTableWidgetItem,
+    ru_item: QTableWidgetItem,
+    ja_prob: float,
+    ru_prob: float,
+) -> None:
+    base = table.palette().color(QPalette.Base)
+    if base.lightness() < 128:
+        primary = QColor(255, 170, 64)
+        secondary = QColor(140, 190, 255)
+    else:
+        primary = QColor(200, 0, 0)
+        secondary = QColor(0, 0, 180)
+    if ja_prob >= ru_prob:
+        ja_item.setForeground(primary)
+        ru_item.setForeground(secondary)
+    else:
+        ru_item.setForeground(primary)
+        ja_item.setForeground(secondary)
 
 
 def populate_table(table: QTableWidget, result: Dict[str, Any]) -> None:
@@ -49,13 +72,7 @@ def populate_table(table: QTableWidget, result: Dict[str, Any]) -> None:
         text_item = QTableWidgetItem(disp_txt)
         for it in (start_item, end_item, ja_item, ru_item):
             it.setTextAlignment(Qt.AlignCenter)
-        from PySide6.QtGui import QColor
-        if ja_prob >= ru_prob:
-            ja_item.setForeground(QColor(200, 0, 0))
-            ru_item.setForeground(QColor(0, 0, 180))
-        else:
-            ru_item.setForeground(QColor(200, 0, 0))
-            ja_item.setForeground(QColor(0, 0, 180))
+        apply_prob_colors(table, ja_item, ru_item, ja_prob, ru_prob)
         table.setItem(row, 0, start_item)
         table.setItem(row, 1, end_item)
         table.setItem(row, 2, ja_item)
