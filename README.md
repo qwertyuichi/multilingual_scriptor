@@ -35,13 +35,24 @@ Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シ�
 ### 3.2 依存パッケージ
 `requirements.txt`:
 ```
-openai-whisper
+faster-whisper
 torch
 numpy
 scipy
 webrtcvad
 PySide6
 ```
+
+#### PyTorch の必要性について
+本プロジェクトは `faster-whisper` (CTranslate2 ベース) を使用していますが、**現在のコードは PyTorch (`torch`) にも依存しています**。
+
+ただし、**CTranslate2/faster-whisper 自体は PyTorch を要求しません**。CTranslate2 は独自のC++推論エンジンで、PyTorch とは独立して動作します。
+
+現在のコードで PyTorch を使用している箇所：
+- **CUDA GPU デバイスの検出**: `torch.cuda.is_available()` で GPU の利用可否を判定
+- **GPU メモリ管理**: モデルキャッシュクリア時に `torch.cuda.empty_cache()` で VRAM を解放
+
+> **注意**: `torch.cuda.empty_cache()` は CTranslate2 が管理するメモリには効果がありません。将来的には PyTorch 依存を削除し、faster-whisper のネイティブ機能のみで動作するよう最適化する余地があります。
 
 インストール例 (Windows PowerShell):
 ```pwsh
@@ -241,13 +252,12 @@ DEBUG ログで以下を追跡:
 ---
 ## 12. パフォーマンス & 改善余地
 - smaller モデル選択 / GPU 利用
-- faster-whisper (CTranslate2) 置換検討
 - 連続複数セグメントの一括再トランスクリプト最適化
 - 事前 VAD マスク適用で無音区間スキップ向上
 
 ---
 ## 13. ライセンス / 出典
-- OpenAI Whisper (MIT) https://github.com/openai/whisper
+- faster-whisper (MIT) https://github.com/SYSTRAN/faster-whisper
 - 本ツール: ライセンス未記載（必要なら `LICENSE` 追加推奨: MIT など）
 
 ---
