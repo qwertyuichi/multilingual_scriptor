@@ -5,6 +5,16 @@ GUI/再文字起こしパイプラインで散在していたマジック文字�
 """
 from __future__ import annotations
 
+# 利用可能な Whisper 公式モデル名一覧 (UI コンボボックス用)
+WHISPER_MODELS: list[str] = [
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3",
+    "turbo",
+]
+
 # プレースホルダ表示用テキスト
 PLACEHOLDER_PENDING = "[再解析中]"
 
@@ -29,6 +39,7 @@ MAX_RANGE_SEC = 30.0
 DEFAULT_MODEL_CACHE_LIMIT = 2
 
 __all__ = [
+    "WHISPER_MODELS",
     "PLACEHOLDER_PENDING",
     "DEFAULT_WATCHDOG_TIMEOUT_MS",
     "MIN_SEGMENT_DUR",
