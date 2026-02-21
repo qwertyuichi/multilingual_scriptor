@@ -35,7 +35,6 @@ Thumbs.db
 output/
 video/
 old/
-models/
 cache/
 whisper_cache/
 
