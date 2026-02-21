@@ -43,8 +43,8 @@ PySide6
 
 インストール例 (Windows PowerShell):
 ```pwsh
-python -m venv .venv
-./.venv/Scripts/Activate.ps1
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -152,6 +152,7 @@ initial_prompt = ""
 ## 11. トラブルシュート
 | 症状 | 主原因候補 | 対処 |
 |------|------------|------|
+| `No module named 'pkg_resources'` | venv 内の `webrtcvad.py` が古い | [venv/Lib/site-packages/webrtcvad.py](venv/Lib/site-packages/webrtcvad.py) の `import pkg_resources` を `import importlib.metadata` に、`pkg_resources.get_distribution(...).version` を `importlib.metadata.version(...)` に書き換える |
 | ffmpeg が見つからない | PATH 未設定 | FFmpeg インストール & パス確認 (`ffmpeg -version`) |
 | GPU が使われない | CUDA ドライバ不足 / CPU ビルド | `torch.cuda.is_available()` 確認 / ドライバ更新 |
 | 途中でフリーズ感 | 長時間モデル推論 | 進捗バー運用 / 小さいモデルへ変更 |
