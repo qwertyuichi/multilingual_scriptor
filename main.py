@@ -7,7 +7,7 @@ import sys
 from PySide6.QtCore import QLoggingCategory
 from PySide6.QtWidgets import QApplication
 
-from logging_config import setup_logging
+from core.logging_config import setup_logging
 from ui.app import VideoTranscriptionApp
 
 QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg=false")

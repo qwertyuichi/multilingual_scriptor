@@ -6,7 +6,7 @@
  - config.toml の [logging] セクション (なければ default) を参照
 
 使用方法:
-    from logging_config import setup_logging, get_logger
+    from core.logging_config import setup_logging, get_logger
     setup_logging(config_dict)
     logger = get_logger(__name__)
 

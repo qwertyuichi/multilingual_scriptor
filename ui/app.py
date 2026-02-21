@@ -53,15 +53,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from constants import (
+from core.constants import (
     WHISPER_MODELS,
     PLACEHOLDER_PENDING,
     DEFAULT_WATCHDOG_TIMEOUT_MS,
     MIN_SEGMENT_DUR,
     MAX_RANGE_SEC,
 )
-from exporter import build_export_text, build_json_payload
-from logging_config import setup_logging, get_logger
+from core.exporter import build_export_text, build_json_payload
+from core.logging_config import setup_logging, get_logger
 from models.segment import Segment, as_segment_list
 from services.retranscribe_ops import dynamic_time_split, merge_contiguous_segments
 from services.segment_ops import split_segment_at_position, adjust_boundary

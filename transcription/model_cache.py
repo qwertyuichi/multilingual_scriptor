@@ -11,8 +11,8 @@ from collections import OrderedDict
 import torch
 import whisper
 
-from constants import DEFAULT_MODEL_CACHE_LIMIT
-from logging_config import get_logger
+from core.constants import DEFAULT_MODEL_CACHE_LIMIT
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 

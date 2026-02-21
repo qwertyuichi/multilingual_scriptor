@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import whisper
 
-from constants import (
+from core.constants import (
     DEFAULT_SILENCE_RMS_THRESHOLD,
     DEFAULT_MIN_VOICE_RATIO,
     DEFAULT_MAX_SILENCE_REPEAT,
@@ -35,7 +35,7 @@ from transcription.audio import (
 )
 from transcription.model_cache import _load_cached_model
 from utils.timefmt import format_ms, to_srt_timestamp
-from logging_config import get_logger
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
