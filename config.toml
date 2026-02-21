@@ -17,6 +17,14 @@
     # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
     # min_seg_dur: 1セグメントの最小継続時間(秒)
     min_seg_dur = 0.60
+    # silence_rms_threshold: これ未満の RMS (平均振幅) なら無音としてスキップ
+    silence_rms_threshold = 0.0045
+    # min_voice_ratio: VAD で音声と判定されたフレーム比率の下限 (0~1)。下回れば無音扱い
+    min_voice_ratio = 0.18
+    # max_silence_repeat: 低エネルギー条件 (RMS/voice_ratio 両方閾値以下) で
+    #   同一 (JA/RU 両方) テキストが連続で出た場合に許容する回数。
+    #   1=2回目で抑止。0=即抑止（推奨しない）。
+    max_silence_repeat = 1
     # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
     vad_level = 2
     # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)
@@ -51,6 +59,12 @@
     # ===== 詳細設定 (GUI: 詳細設定 生成順) =====
     # min_seg_dur: 1セグメントの最小継続時間(秒)
     min_seg_dur = 0.60
+    # silence_rms_threshold: これ未満の RMS (平均振幅) なら無音としてスキップ
+    silence_rms_threshold = 0.0045
+    # min_voice_ratio: VAD で音声と判定されたフレーム比率の下限 (0~1)。下回れば無音扱い
+    min_voice_ratio = 0.18
+    # max_silence_repeat: 低エネルギー条件 (RMS/voice_ratio 両方閾値以下) で同一テキストが連続したら抑止する許容回数
+    max_silence_repeat = 1
     # vad_level: WebRTC VAD 感度 (0=寛容 ～ 3=厳格)
     vad_level = 2
     # gap_threshold: 無音区間として扱う最小秒 (include_silent が有効のとき)

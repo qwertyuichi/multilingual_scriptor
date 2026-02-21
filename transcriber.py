@@ -98,21 +98,39 @@ def _build_hybrid_segments(model, audio_path: str, min_seg_dur: float = 0.25) ->
         return [{'start': s['start'], 'end': s['end']} for s in ja_res.get('segments', [])]
     return merged
 
-def _has_voice(segment: np.ndarray, sample_rate: int = 16000, vad_level: int = 2) -> bool:
-    """簡易 VAD。一定長未満は肯定。WebRTC VAD で 30ms フレーム判定。"""
+def _has_voice(segment: np.ndarray, sample_rate: int = 16000, vad_level: int = 2, return_analysis: bool = False):
+    """簡易 VAD + 分析値。
+
+    return_analysis=False -> bool のみ返す (後方互換)
+    return_analysis=True  -> (has_voice: bool, voiced_ratio: float)
+    """
     if len(segment) < sample_rate * 0.2:
-        return True
+        return (True, 1.0) if return_analysis else True
     vad = webrtcvad.Vad(vad_level)
     frame_dur_ms = 30
     frame_size = int(sample_rate * frame_dur_ms / 1000)
     pcm16 = (np.clip(segment, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+    total = 0
+    voiced = 0
     for offset in range(0, len(pcm16), frame_size * 2):
         frame = pcm16[offset: offset + frame_size * 2]
         if len(frame) < frame_size * 2:
             break
-        if vad.is_speech(frame, sample_rate):
-            return True
-    return False
+        total += 1
+        try:
+            if vad.is_speech(frame, sample_rate):
+                voiced += 1
+        except Exception:
+            pass
+    if total == 0:
+        res = False
+        ratio = 0.0
+    else:
+        ratio = voiced / total
+        res = voiced > 0
+    if return_analysis:
+        return res, ratio
+    return res
 
 def _detect_lang_probs(model, audio_segment: np.ndarray | torch.Tensor,
                        ja_weight: float = 1.0, ru_weight: float = 1.0) -> tuple[str, float, float]:
@@ -220,10 +238,15 @@ def advanced_process_video(
     srt_max_line: int = 50,
     include_silent: bool = False,
     debug: bool = False,
+    duplicate_merge: bool = True,
+    duplicate_debug: bool = True,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
     segment_callback: Optional[Callable[[dict], None]] = None,
+    silence_rms_threshold: float | None = None,
+    min_voice_ratio: float | None = None,
+    max_silence_repeat: int | None = None,
 ) -> dict:
     """動画を高度ルールで処理し GUI 互換の結果 dict を返す。
     戻り値: {'text': str, 'segments': [{'start','end','text','id'}], 'language': 'mixed'}
@@ -232,6 +255,14 @@ def advanced_process_video(
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
     logger.info('[ADV] loading models ...')  # モデルロードログ
+    from constants import (
+        DEFAULT_SILENCE_RMS_THRESHOLD,
+        DEFAULT_MIN_VOICE_RATIO,
+        DEFAULT_MAX_SILENCE_REPEAT,
+    )
+    silence_rms_threshold = silence_rms_threshold if silence_rms_threshold is not None else DEFAULT_SILENCE_RMS_THRESHOLD
+    min_voice_ratio = min_voice_ratio if min_voice_ratio is not None else DEFAULT_MIN_VOICE_RATIO
+    max_silence_repeat = max_silence_repeat if max_silence_repeat is not None else DEFAULT_MAX_SILENCE_REPEAT
     # デバイス決定 (None の場合は自動)
     selected_device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     if selected_device == 'cuda' and not torch.cuda.is_available():
@@ -278,6 +309,12 @@ def advanced_process_video(
         prev_end = 0.0
         idx = 0
         total_segments = len(initial_segments)
+        # 重複マージ制御定数
+        from constants import DUP_MERGE_MAX_SEG_DUR, DUP_MERGE_MAX_GAP
+        last_merged_index = -1  # gui_segments 内の直近 index
+        # 低エネルギー重複テキスト抑止用
+        recent_low_energy_texts: list[str] = []
+        LOW_TXT_HISTORY = 8
         for seg in initial_segments:
             if cancel_flag and cancel_flag():
                 if status_callback:
@@ -303,9 +340,13 @@ def advanced_process_video(
                 if include_silent:
                     output_lines.append(f"[SKIP short {st:.2f}-{ed:.2f}]")
                 continue
-            if not _has_voice(clip, vad_level=vad_level):
+            # ---------- 無音/低エネルギーフィルタ ----------
+            rms = float(np.sqrt(np.mean(np.square(clip)))) if clip.size else 0.0
+            has_voice_basic, voiced_ratio = _has_voice(clip, vad_level=vad_level, return_analysis=True)
+            low_energy = (rms < silence_rms_threshold) or (voiced_ratio < min_voice_ratio)
+            if low_energy and not has_voice_basic:
                 if include_silent:
-                    output_lines.append(f"[SKIP silence {st:.2f}-{ed:.2f}]")
+                    output_lines.append(f"[SKIP silence_rms {st:.2f}-{ed:.2f} rms={rms:.5f} vr={voiced_ratio:.3f}]")
                 continue
             # クリップshapeチェック・値確認（リサンプリングは行わずpad/trimmingのみ）
             if not isinstance(clip, np.ndarray) or clip.ndim != 1 or clip.size == 0:
@@ -330,6 +371,17 @@ def advanced_process_video(
                 chosen_lang = 'ru'
             if not (ja_text or ru_text):
                 continue
+            # 低エネルギー下の定型抑止: JA/RU 両方が recent に存在し、かつ低エネルギーなら抑止
+            if low_energy:
+                key_pair = f"{ja_text}|{ru_text}"
+                repeats = recent_low_energy_texts.count(key_pair)
+                if repeats >= max_silence_repeat:
+                    if include_silent:
+                        output_lines.append(f"[SUPPRESS patterned {st:.2f}-{ed:.2f} '{ja_text[:20]}' rms={rms:.5f} vr={voiced_ratio:.3f}]")
+                    continue
+                recent_low_energy_texts.append(key_pair)
+                if len(recent_low_energy_texts) > LOW_TXT_HISTORY:
+                    recent_low_energy_texts.pop(0)
             def fmt_ts(t: float) -> str:
                 td = timedelta(seconds=t)
                 total_seconds = td.total_seconds()
@@ -339,28 +391,67 @@ def advanced_process_video(
                 return f"{h:02d}:{m:02d}:{s:06.3f}"
             ts_start, ts_end = fmt_ts(st), fmt_ts(ed)
             line = f"[{ts_start} -> {ts_end}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] JA={ja_text} | RU={ru_text}".strip()
-            output_lines.append(line)
-            seg_dict = {
-                'start': st,
-                'end': ed,
-                'text': seg_text,
-                'text_ja': ja_text,
-                'text_ru': ru_text,
-                'chosen_language': chosen_lang,
-                'id': idx,
-                'ja_prob': ja_prob,
-                'ru_prob': ru_prob
-            }
-            gui_segments.append(seg_dict)
-            if segment_callback:
-                # 逐次通知（GUI 側でテーブルへ追加）
-                try:
-                    segment_callback(seg_dict)
-                except Exception:
-                    pass
+
+            # ---- 重複判定 & マージ ----
+            merged = False
+            if duplicate_merge and gui_segments:
+                prev = gui_segments[-1]
+                prev_st = float(prev.get('start', st))
+                prev_ed = float(prev.get('end', prev_st))
+                gap = st - prev_ed
+                seg_len = ed - st
+                prev_len = prev_ed - prev_st
+                # 条件: 直前と JA/RU 完全一致 かつ 区間長閾値以下 + ギャップ閾値以内
+                if (
+                    abs(gap) <= DUP_MERGE_MAX_GAP and
+                    seg_len <= DUP_MERGE_MAX_SEG_DUR and
+                    ja_text == prev.get('text_ja','') and
+                    ru_text == prev.get('text_ru','')
+                ):
+                    # prev を延長
+                    prev['end'] = ed
+                    # 確率は単純平均 (長さ重みは後回し)
+                    prev['ja_prob'] = (prev.get('ja_prob', ja_prob) + ja_prob) / 2.0
+                    prev['ru_prob'] = (prev.get('ru_prob', ru_prob) + ru_prob) / 2.0
+                    # メインテキストは chosen_language に合わせて維持
+                    merged = True
+                    if duplicate_debug:
+                        logger.debug(
+                            f"[DUP_MERGE] merged identical seg: prev=({prev_st:.2f}-{prev_ed:.2f}) -> ({prev_st:.2f}-{ed:.2f}) text='{seg_text[:40]}'"
+                        )
+            if merged:
+                # ログ行も最後を差し替え
+                if output_lines:
+                    output_lines[-1] = f"[{fmt_ts(prev_st)} -> {fmt_ts(ed)}] [JA:{gui_segments[-1]['ja_prob']:05.2f}%] [RU:{gui_segments[-1]['ru_prob']:05.2f}%] JA={ja_text} | RU={ru_text}".strip()
+            else:
+                output_lines.append(line)
+                seg_dict = {
+                    'start': st,
+                    'end': ed,
+                    'text': seg_text,
+                    'text_ja': ja_text,
+                    'text_ru': ru_text,
+                    'chosen_language': chosen_lang,
+                    'id': idx,
+                    'ja_prob': ja_prob,
+                    'ru_prob': ru_prob
+                }
+                gui_segments.append(seg_dict)
+                if segment_callback:
+                    # 逐次通知（GUI 側でテーブルへ追加）
+                    try:
+                        segment_callback(seg_dict)
+                    except Exception:
+                        pass
+                idx += 1
             # SRT 用
-            srt_entries.append((idx+1, st, ed, seg_text))
-            idx += 1
+            if merged:
+                # 直前 SRT エントリ更新 (延長)
+                if srt_entries:
+                    num, st0, _, txt0 = srt_entries[-1]
+                    srt_entries[-1] = (num, st0, ed, txt0)
+            else:
+                srt_entries.append((idx, st, ed, seg_text))
         if status_callback:
             status_callback('出力整形中...')
         full_text = '\n'.join(output_lines)
@@ -437,6 +528,11 @@ class TranscriptionThread(QThread):
                 srt_max_line=self.options.get('srt_max_line', 50),
                 include_silent=self.options.get('include_silent', False),
                 debug=self.options.get('debug_segments', False),
+                duplicate_merge=self.options.get('duplicate_merge', True),
+                duplicate_debug=self.options.get('duplicate_debug', True),
+                silence_rms_threshold=self.options.get('silence_rms_threshold'),
+                min_voice_ratio=self.options.get('min_voice_ratio'),
+                max_silence_repeat=self.options.get('max_silence_repeat'),
                 progress_callback=lambda p: self.progress.emit(p),
                 status_callback=lambda m: self.status.emit(m),
                 cancel_flag=self.is_cancelled,
@@ -482,6 +578,8 @@ class RangeTranscriptionThread(QThread):
                 ambiguous_threshold=self.options.get('ambiguous_threshold', 10.0),
                 progress_callback=lambda p: self.progress.emit(p),
                 status_callback=lambda m: self.status.emit(m),
+                silence_rms_threshold=self.options.get('silence_rms_threshold'),
+                min_voice_ratio=self.options.get('min_voice_ratio'),
             )
             self.progress.emit(100)
             self.status.emit('部分再文字起こし完了')
@@ -556,6 +654,8 @@ def transcribe_range(
     ambiguous_threshold: float = 10.0,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
+    silence_rms_threshold: float | None = None,
+    min_voice_ratio: float | None = None,
 ) -> dict:
     """動画ファイル中の指定秒区間 [start_sec, end_sec] を抽出し JA/RU 両言語で再文字起こし。
 
@@ -595,6 +695,21 @@ def transcribe_range(
         audio_arr = whisper.load_audio(cut_path)
         if audio_arr.size == 0:
             raise RuntimeError('音声抽出に失敗しました')
+        from constants import DEFAULT_SILENCE_RMS_THRESHOLD, DEFAULT_MIN_VOICE_RATIO
+        silence_rms_threshold = silence_rms_threshold if silence_rms_threshold is not None else DEFAULT_SILENCE_RMS_THRESHOLD
+        min_voice_ratio = min_voice_ratio if min_voice_ratio is not None else DEFAULT_MIN_VOICE_RATIO
+        rms = float(np.sqrt(np.mean(np.square(audio_arr)))) if audio_arr.size else 0.0
+        has_voice_basic, voiced_ratio = _has_voice(audio_arr, vad_level=2, return_analysis=True)
+        if (rms < silence_rms_threshold or voiced_ratio < min_voice_ratio) and not has_voice_basic:
+            if status_callback:
+                status_callback('部分再文字起こし: 無音区間 (スキップ)')
+            return {
+                'start': start_sec,
+                'end': end_sec,
+                'text': '', 'text_ja': '', 'text_ru': '',
+                'ja_prob': 0.0, 'ru_prob': 0.0,
+                'chosen_language': 'ja'
+            }
         if status_callback:
             status_callback('部分再文字起こし: 言語判定中...')
         detected_lang, ja_prob, ru_prob = _detect_lang_probs(model, audio_arr, ja_weight, ru_weight)

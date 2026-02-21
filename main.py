@@ -1839,6 +1839,24 @@ class VideoTranscriptionApp(QMainWindow):
         # 言語 weight スライダー値を追加 (0-300 -> 0.00-3.00)
         options["ja_weight"] = self.ja_weight_slider.value() / 100.0
         options["ru_weight"] = self.ru_weight_slider.value() / 100.0
+        # 重複マージ / デバッグフラグ (config の [debug] セクションがあれば参照)
+        try:
+            dbg_conf = self.config.get('debug', {}) if isinstance(self.config, dict) else {}
+            dup_merge = bool(dbg_conf.get('duplicate_merge', True))
+            dup_debug = bool(dbg_conf.get('duplicate_debug', True))
+        except Exception:
+            dup_merge = True
+            dup_debug = True
+        options['duplicate_merge'] = dup_merge
+        options['duplicate_debug'] = dup_debug
+        # 無音抑制設定 (存在すれば優先)
+        try:
+            prof_conf = self.config.get(self.current_profile_name, {}) if isinstance(self.config, dict) else {}
+            options['silence_rms_threshold'] = prof_conf.get('silence_rms_threshold')
+            options['min_voice_ratio'] = prof_conf.get('min_voice_ratio')
+            options['max_silence_repeat'] = prof_conf.get('max_silence_repeat')
+        except Exception:
+            pass
         # アクセント補正 (config の値を使う: GUI 未露出)
         cfg_default = self.config.get("default", {})
         # ru_accent_boost 廃止: 旧設定があっても無視
