@@ -31,10 +31,10 @@ def rebuild_aggregate_text(result: Dict[str, Any]) -> None:
 
 def apply_prob_colors(
     table: QTableWidget,
-    ja_item: QTableWidgetItem,
-    ru_item: QTableWidgetItem,
-    ja_prob: float,
-    ru_prob: float,
+    item1: QTableWidgetItem,
+    item2: QTableWidgetItem,
+    lang1_prob: float,
+    lang2_prob: float,
 ) -> None:
     base = table.palette().color(QPalette.Base)
     if base.lightness() < 128:
@@ -43,12 +43,12 @@ def apply_prob_colors(
     else:
         primary = QColor(200, 0, 0)
         secondary = QColor(0, 0, 180)
-    if ja_prob >= ru_prob:
-        ja_item.setForeground(primary)
-        ru_item.setForeground(secondary)
+    if lang1_prob >= lang2_prob:
+        item1.setForeground(primary)
+        item2.setForeground(secondary)
     else:
-        ru_item.setForeground(primary)
-        ja_item.setForeground(secondary)
+        item2.setForeground(primary)
+        item1.setForeground(secondary)
 
 
 def populate_table(table: QTableWidget, result: Dict[str, Any]) -> None:
@@ -61,20 +61,19 @@ def populate_table(table: QTableWidget, result: Dict[str, Any]) -> None:
         end_sec = seg.get('end', 0.0)
         start_str = format_ms(int(start_sec * 1000))
         end_str = format_ms(int(end_sec * 1000))
-        # GAP でも通常行として空文字表示 (色付与不要で簡潔化)
-        ja_prob = seg.get('ja_prob', 0.0)
-        ru_prob = seg.get('ru_prob', 0.0)
+        lang1_prob = seg.get('lang1_prob', 0.0)
+        lang2_prob = seg.get('lang2_prob', 0.0)
         disp_txt = display_text(seg)
         start_item = QTableWidgetItem(start_str)
         end_item = QTableWidgetItem(end_str)
-        ja_item = QTableWidgetItem(f"{ja_prob:.2f}")
-        ru_item = QTableWidgetItem(f"{ru_prob:.2f}")
+        item1 = QTableWidgetItem(f"{lang1_prob:.2f}")
+        item2 = QTableWidgetItem(f"{lang2_prob:.2f}")
         text_item = QTableWidgetItem(disp_txt)
-        for it in (start_item, end_item, ja_item, ru_item):
+        for it in (start_item, end_item, item1, item2):
             it.setTextAlignment(Qt.AlignCenter)
-        apply_prob_colors(table, ja_item, ru_item, ja_prob, ru_prob)
+        apply_prob_colors(table, item1, item2, lang1_prob, lang2_prob)
         table.setItem(row, 0, start_item)
         table.setItem(row, 1, end_item)
-        table.setItem(row, 2, ja_item)
-        table.setItem(row, 3, ru_item)
+        table.setItem(row, 2, item1)
+        table.setItem(row, 3, item2)
         table.setItem(row, 4, text_item)

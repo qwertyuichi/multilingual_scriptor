@@ -23,7 +23,6 @@ from faster_whisper.audio import decode_audio as fw_decode_audio
 
 from core.constants import DUP_MERGE_MAX_SEG_DUR, DUP_MERGE_MAX_GAP, MAX_RANGE_SEC
 from transcription.audio import (
-    clean_hallucination,
     _extract_audio,
     _weight_lang_probs,
 )
@@ -44,8 +43,8 @@ def advanced_process_video(
     model_size: str = 'large-v3',
     device: str | None = None,
     languages: list[str] | None = None,
-    ja_weight: float = 1.0,
-    ru_weight: float = 1.0,
+    lang1_weight: float = 1.0,
+    lang2_weight: float = 1.0,
     beam_size: int = 5,
     no_speech_threshold: float = 0.6,
     initial_prompt: str | None = None,
@@ -63,6 +62,8 @@ def advanced_process_video(
     phase1_beam_size: int | None = None,
     phase2_detect_beam_size: int | None = None,
     phase2_retranscribe_beam_size: int | None = None,
+    # script-boost & hallucination cleanup removed
+    debug_prob_log: bool = False,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
@@ -71,8 +72,9 @@ def advanced_process_video(
     """動画を faster-whisper + Silero VAD で処理し GUI 互換の結果 dict を返す。
 
     戻り値: {'text': str, 'segments': list[dict], 'language': 'mixed'}
-    各 segment dict: {'start', 'end', 'text', 'text_ja', 'text_ru',
-                      'chosen_language', 'id', 'ja_prob', 'ru_prob'}
+    各 segment dict: {'start', 'end', 'text', 'text_lang1', 'text_lang2',
+                      'chosen_language', 'id', 'lang1_prob', 'lang2_prob',
+                      'lang1_code', 'lang2_code'}
     """
     # Phase別のbeam_sizeのデフォルトフォールバック
     _phase1_beam = phase1_beam_size if phase1_beam_size is not None else beam_size
@@ -81,9 +83,9 @@ def advanced_process_video(
     
     if languages is None:
         languages = ['ja']
-    # Phase 1 は常に自動検出モード (JA/RU 混在に対応)
-    lang_arg = None
-    multilingual = True
+    lang1: str = languages[0]
+    lang2: str | None = languages[1] if len(languages) > 1 else None
+    # Phase 1 は常に自動検出モード (lang1/lang2 混在に対応)
 
     # デバイス決定
     selected_device = device or ('cuda' if _CUDA_AVAILABLE else 'cpu')
@@ -119,10 +121,12 @@ def advanced_process_video(
             'speech_pad_ms': speech_pad_ms,
         }
 
+        phase1_language = None if lang2 else lang1
+        phase1_multilingual = True if lang2 else False
         segments_gen, info = model.transcribe(
             audio_path,
-            language=lang_arg,
-            multilingual=multilingual,
+            language=phase1_language,
+            multilingual=phase1_multilingual,
             beam_size=_phase1_beam,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
@@ -137,10 +141,12 @@ def advanced_process_video(
         )
 
         # グローバル言語確率 (フォールバック用)
-        ja_global, ru_global = _weight_lang_probs(info.all_language_probs, ja_weight, ru_weight)
+        lang1_global, lang2_global, _ = _weight_lang_probs(
+            info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
+        )
         logger.info(
             f'[LANG] all_language_probs size={len(info.all_language_probs or [])} '
-            f'ja_global={ja_global:.1f}% ru_global={ru_global:.1f}%'
+            f'lang1({lang1})_global={lang1_global:.1f}% lang2({lang2 or "-"})_global={lang2_global:.1f}%'
         )
 
         # ジェネレータを実体化 (ここで実際の Whisper 推論が走る)
@@ -151,7 +157,7 @@ def advanced_process_video(
                 if status_callback:
                     status_callback('キャンセル中...')
                 break
-            text = clean_hallucination(seg.text.strip())
+            text = seg.text.strip()
             if not text:
                 continue
             raw_segs.append((seg.start, seg.end, text))
@@ -185,6 +191,8 @@ def advanced_process_video(
                 if status_callback:
                     status_callback('キャンセル中...')
                 break
+            raw_text = text
+            boost_applied = False
             
             # 無音区間の挿入（前のセグメント終了から現在のセグメント開始までのギャップ）
             gap = st - prev_end_time
@@ -193,12 +201,14 @@ def advanced_process_video(
                     'start': prev_end_time,
                     'end': st,
                     'text': '',
-                    'text_ja': '',
-                    'text_ru': '',
+                    'text_lang1': '',
+                    'text_lang2': '',
                     'chosen_language': 'silence',
                     'id': idx,
-                    'ja_prob': 0.0,
-                    'ru_prob': 0.0,
+                    'lang1_prob': 0.0,
+                    'lang2_prob': 0.0,
+                    'lang1_code': lang1,
+                    'lang2_code': lang2 or '',
                 }
                 gui_segments.append(silence_seg)
                 output_lines.append(
@@ -215,9 +225,11 @@ def advanced_process_video(
             clip_s = max(0, int(st * SR))
             clip_e = min(len(audio_arr), int(ed * SR))
             clip = audio_arr[clip_s:clip_e]
+            clip_too_short = len(clip) < SR // 5  # 200ms 未満
 
             # クリップ個別言語検出 (beam_size=_phase2_detect_beam で高速化)
-            if len(clip) >= SR // 5:  # 200ms 以上のクリップのみ再検出
+            detected_lang = None
+            if not clip_too_short:
                 try:
                     _, clip_info = model.transcribe(
                         clip,
@@ -228,94 +240,137 @@ def advanced_process_video(
                         condition_on_previous_text=False,
                         no_speech_threshold=0.95,
                     )
-                    ja_prob, ru_prob = _weight_lang_probs(
-                        clip_info.all_language_probs, ja_weight, ru_weight
+                    detected_lang = clip_info.language
+                    lang1_prob, lang2_prob, is_confident = _weight_lang_probs(
+                        clip_info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
                     )
                     logger.debug(
                         f'[CLIP_LANG] #{idx} t={st:.2f}-{ed:.2f} '
-                        f'ja={ja_prob:.1f}% ru={ru_prob:.1f}% '
+                        f'{lang1}={lang1_prob:.1f}% {lang2 or "-"}={lang2_prob:.1f}% '
+                        f'confident={is_confident} '
                         f'(clip: {clip_info.language} p={clip_info.language_probability:.2f})'
                     )
                 except Exception as e:
                     logger.warning(f'[CLIP_LANG] #{idx} t={st:.2f}-{ed:.2f} 失敗、グローバルで代替: {e}')
-                    ja_prob, ru_prob = ja_global, ru_global
+                    lang1_prob, lang2_prob, is_confident = lang1_global, lang2_global, False
             else:
-                ja_prob, ru_prob = ja_global, ru_global
+                lang1_prob, lang2_prob, is_confident = lang1_global, lang2_global, False
 
-            # キリル文字があれば RU に強制 (カタカナ音訳にも保険)
-            ru_chars = sum(1 for c in text if '\u0400' <= c <= '\u04ff')
-            if ru_chars > 0:
-                ru_prob = max(ru_prob, 92.0)
-                ja_prob = 100.0 - ru_prob
-
-            chosen_lang = 'ja' if ja_prob >= ru_prob else 'ru'
-            # 確率差が ambiguous_threshold 未満なら「あいまい」判定 → 両言語を転写
-            is_ambiguous = (
-                abs(ja_prob - ru_prob) < ambiguous_threshold
-                and len(clip) >= SR // 5
-            )
-
-            if chosen_lang == 'ja':
-                # Phase 1 テキストはすでに JA 転写なのでそのまま使用
-                text_ja = text
-                # あいまいなら RU も転写しておく
-                if is_ambiguous:
+            handled_other_lang = False
+            if detected_lang and detected_lang not in {lang1, lang2}:
+                # 選択外言語が最有力: 可能ならその言語で再転写
+                chosen_lang = detected_lang
+                lang1_prob, lang2_prob = 0.0, 0.0
+                text_lang1 = ''
+                text_lang2 = ''
+                other_text = ''
+                if not clip_too_short:
                     try:
-                        amb_ru_gen, _ = model.transcribe(
+                        other_gen, _ = model.transcribe(
                             clip,
-                            language='ru',
+                            language=detected_lang,
                             beam_size=_phase2_retrans_beam,
                             temperature=0.0,
                             vad_filter=False,
                             condition_on_previous_text=False,
                             no_speech_threshold=no_speech_threshold,
                         )
-                        amb_ru_texts = [
-                            clean_hallucination(s.text.strip())
-                            for s in amb_ru_gen
-                            if s.text.strip()
-                        ]
-                        text_ru = ' '.join(amb_ru_texts) if amb_ru_texts else ''
-                        logger.debug(
-                            f'[AMBIGUOUS_RU] #{idx} t={st:.2f}-{ed:.2f} '
-                            f'ja={ja_prob:.1f}% ru={ru_prob:.1f}% '
-                            f'text_ru=\"{text_ru[:60]}\"'
-                        )
+                        other_texts = [s.text.strip() for s in other_gen if s.text.strip()]
+                        other_text = ' '.join(other_texts).strip()
                     except Exception as e:
-                        logger.warning(f'[AMBIGUOUS_RU] #{idx} 失敗: {e}')
-                        text_ru = ''
+                        logger.warning(f'[RETRANSCRIBE_{detected_lang}] #{idx} t={st:.2f}-{ed:.2f} 失敗: {e}')
+                text = other_text
+                is_ambiguous = False
+                handled_other_lang = True
+            # 選択外言語の可能性が高い場合: Phase1 テキストを保持し 'other' 扱い (BUG-11修正)
+            if not handled_other_lang and not is_confident:
+                # 低信頼度クリップは選択外言語扱い
+                if lang2 is None:
+                    # 単言語モードでは指定言語で文字起こしした結果を採用
+                    lang1_prob, lang2_prob = 100.0, 0.0
+                    chosen_lang = lang1
+                    text_lang1 = text
+                    text_lang2 = ''
                 else:
-                    text_ru = ''
-            else:
-                # RU 判定: language='ru' で再転写してキリル文字テキストを取得
-                text_ja_orig = text  # Phase 1 の JA テキストを退避
-                if len(clip) >= SR // 5:
+                    lang1_prob, lang2_prob = 50.0, 50.0
+                    chosen_lang = 'other'
+                    text_lang1 = text
+                    text_lang2 = ''
+                is_ambiguous = False
+                logger.debug(f'[OTHER_LANG] #{idx} t={st:.2f}-{ed:.2f} 選択言語に低信頼度')
+            elif not handled_other_lang:
+                # スクリプト補強は削除済み。通常の確率比較で優勢言語を決定。
+                chosen_lang = lang1 if lang1_prob >= lang2_prob else (lang2 or lang1)
+                is_ambiguous = (
+                    lang2 is not None
+                    and abs(lang1_prob - lang2_prob) < ambiguous_threshold
+                    and not clip_too_short
+                )
+
+                if clip_too_short or lang2 is None:
+                    # 短すぎる/単言語モード: Phase1 テキストを lang1 として保持 (BUG-1修正)
+                    text_lang1 = text
+                    text_lang2 = ''
+                elif chosen_lang == lang1:
+                    # Phase 1 テキストはすでに lang1 転写なのでそのまま使用
+                    text_lang1 = text
+                    if is_ambiguous:
+                        try:
+                            amb_gen, _ = model.transcribe(
+                                clip,
+                                language=lang2,
+                                beam_size=_phase2_retrans_beam,
+                                temperature=0.0,
+                                vad_filter=False,
+                                condition_on_previous_text=False,
+                                no_speech_threshold=no_speech_threshold,
+                            )
+                            amb_texts = [s.text.strip() for s in amb_gen if s.text.strip()]
+                            text_lang2 = ' '.join(amb_texts) if amb_texts else ''
+                            logger.debug(
+                                f'[AMBIGUOUS_{lang2}] #{idx} t={st:.2f}-{ed:.2f} '
+                                f'text_lang2="{text_lang2[:60]}"'
+                            )
+                        except Exception as e:
+                            logger.warning(f'[AMBIGUOUS_{lang2}] #{idx} 失敗: {e}')
+                            text_lang2 = ''
+                    else:
+                        text_lang2 = ''
+                else:
+                    # lang2 判定: language=lang2 で再転写
+                    text_lang1_orig = text
                     try:
-                        ru_gen, _ = model.transcribe(
+                        lang2_gen, _ = model.transcribe(
                             clip,
-                            language='ru',
+                            language=lang2,
                             beam_size=_phase2_retrans_beam,
                             temperature=0.0,
                             vad_filter=False,
                             condition_on_previous_text=False,
                             no_speech_threshold=no_speech_threshold,
                         )
-                        ru_texts = [
-                            clean_hallucination(s.text.strip())
-                            for s in ru_gen
-                            if s.text.strip()
-                        ]
-                        if ru_texts:
-                            text = ' '.join(ru_texts)
+                        lang2_texts = [s.text.strip() for s in lang2_gen if s.text.strip()]
+                        if lang2_texts:
+                            text = ' '.join(lang2_texts)
                             logger.debug(
-                                f'[RU_RETRANSCRIBE] #{idx} t={st:.2f}-{ed:.2f} '
-                                f'text=\"{text[:60]}\"'
+                                f'[RETRANSCRIBE_{lang2}] #{idx} t={st:.2f}-{ed:.2f} '
+                                f'text="{text[:60]}"'
                             )
                     except Exception as e:
-                        logger.warning(f'[RU_RETRANSCRIBE] #{idx} t={st:.2f}-{ed:.2f} 失敗: {e}')
-                text_ru = text
-                # あいまいなら Phase 1 の JA テキストも保持
-                text_ja = text_ja_orig if is_ambiguous else ''
+                        logger.warning(f'[RETRANSCRIBE_{lang2}] #{idx} t={st:.2f}-{ed:.2f} 失敗: {e}')
+                    text_lang2 = text
+                    # あいまいなら Phase 1 の lang1 テキストも保持
+                    text_lang1 = text_lang1_orig if is_ambiguous else ''
+
+                if debug_prob_log:
+                    clip_len = ed - st
+                    logger.info(
+                        f'[PROB_DEBUG] #{idx} t={st:.2f}-{ed:.2f} len={clip_len:.2f}s '
+                        f'short={clip_too_short} conf={is_confident} '
+                        f'boost={"on" if boost_applied else "off"} '
+                        f'p1={lang1_prob:.1f} p2={lang2_prob:.1f} chosen={chosen_lang} '
+                        f'text="{raw_text[:40]}"'
+                    )
 
             if progress_callback:
                 progress_callback(55 + int(35 * (i + 1) / max(total_segs, 1)))
@@ -336,8 +391,8 @@ def advanced_process_video(
                         and text == prev.get('text', '')
                     ):
                         prev['end'] = ed
-                        prev['ja_prob'] = (prev.get('ja_prob', ja_prob) + ja_prob) / 2.0
-                        prev['ru_prob'] = (prev.get('ru_prob', ru_prob) + ru_prob) / 2.0
+                        prev['lang1_prob'] = (prev.get('lang1_prob', lang1_prob) + lang1_prob) / 2.0
+                        prev['lang2_prob'] = (prev.get('lang2_prob', lang2_prob) + lang2_prob) / 2.0
                         merged = True
                         logger.debug(
                             f'[DUP_MERGE] merged: ({prev_st:.2f}-{prev_ed:.2f}) -> '
@@ -349,28 +404,32 @@ def advanced_process_video(
                     g = gui_segments[-1]
                     output_lines[-1] = (
                         f'[{_fmt_ts(g["start"])} -> {_fmt_ts(ed)}] '
-                        f'[JA:{g["ja_prob"]:05.2f}%] [RU:{g["ru_prob"]:05.2f}%] '
-                        f'{text}'
+                        f'[{lang1.upper()}:{g["lang1_prob"]:05.2f}%]'
+                        + (f' [{lang2.upper()}:{g["lang2_prob"]:05.2f}%]' if lang2 else '')
+                        + f' {text}'
                     ).strip()
                 # マージした場合も prev_end_time を更新
                 prev_end_time = ed
             else:
                 line = (
                     f'[{_fmt_ts(st)} -> {_fmt_ts(ed)}] '
-                    f'[JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] '
-                    f'{text}'
+                    f'[{lang1.upper()}:{lang1_prob:05.2f}%]'
+                    + (f' [{lang2.upper()}:{lang2_prob:05.2f}%]' if lang2 else '')
+                    + f' {text}'
                 ).strip()
                 output_lines.append(line)
                 seg_dict = {
                     'start': st,
                     'end': ed,
                     'text': text,
-                    'text_ja': text_ja,
-                    'text_ru': text_ru,
+                    'text_lang1': text_lang1,
+                    'text_lang2': text_lang2,
                     'chosen_language': chosen_lang,
                     'id': idx,
-                    'ja_prob': ja_prob,
-                    'ru_prob': ru_prob,
+                    'lang1_prob': lang1_prob,
+                    'lang2_prob': lang2_prob,
+                    'lang1_code': lang1,
+                    'lang2_code': lang2 or '',
                 }
                 gui_segments.append(seg_dict)
                 if segment_callback:
@@ -387,12 +446,14 @@ def advanced_process_video(
                 'start': prev_end_time,
                 'end': total_dur,
                 'text': '',
-                'text_ja': '',
-                'text_ru': '',
+                'text_lang1': '',
+                'text_lang2': '',
                 'chosen_language': 'silence',
                 'id': idx,
-                'ja_prob': 0.0,
-                'ru_prob': 0.0,
+                'lang1_prob': 0.0,
+                'lang2_prob': 0.0,
+                'lang1_code': lang1,
+                'lang2_code': lang2 or '',
             }
             gui_segments.append(silence_seg)
             output_lines.append(
@@ -430,11 +491,13 @@ def transcribe_range(
     model_size: str = 'large-v3',
     device: str | None = None,
     languages: list[str] | None = None,
-    ja_weight: float = 1.0,
-    ru_weight: float = 1.0,
+    lang1_weight: float = 1.0,
+    lang2_weight: float = 1.0,
     beam_size: int = 5,
     no_speech_threshold: float = 0.6,
     condition_on_previous_text: bool = False,
+    # script-boost & hallucination cleanup removed
+    debug_prob_log: bool = False,
     progress_callback: Optional[Callable[[int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
@@ -443,9 +506,10 @@ def transcribe_range(
     戻り値:
         {
             'start': float, 'end': float,
-            'text': str, 'text_ja': str, 'text_ru': str,
-            'ja_prob': float, 'ru_prob': float,
-            'chosen_language': 'ja' | 'ru'
+            'text': str, 'text_lang1': str, 'text_lang2': str,
+            'lang1_prob': float, 'lang2_prob': float,
+            'lang1_code': str, 'lang2_code': str | None,
+            'chosen_language': str
         }
     """
     if end_sec <= start_sec:
@@ -455,8 +519,8 @@ def transcribe_range(
 
     if languages is None:
         languages = ['ja']
-    multilingual = len(languages) > 1
-    lang_arg = languages[0] if len(languages) == 1 else None
+    lang1 = languages[0]
+    lang2 = languages[1] if len(languages) > 1 else None
 
     if progress_callback:
         progress_callback(5)
@@ -495,10 +559,9 @@ def transcribe_range(
         if status_callback:
             status_callback('部分再文字起こし: 言語判定中...')
 
-        # Phase A: クリップ単位の言語検出 (advanced_process_video と同方式)
+        # Phase A: クリップ単位の言語検出
         audio_arr = fw_decode_audio(cut_path, sampling_rate=SR)
-        ja_prob: float
-        ru_prob: float
+        detected_lang = None
         if len(audio_arr) >= SR // 5:
             _det_gen, clip_info = model.transcribe(
                 audio_arr,
@@ -511,10 +574,18 @@ def transcribe_range(
             )
             for _ in _det_gen:
                 pass
-            ja_prob, ru_prob = _weight_lang_probs(clip_info.all_language_probs, ja_weight, ru_weight)
+            detected_lang = clip_info.language
+            lang1_prob, lang2_prob, is_confident = _weight_lang_probs(
+                clip_info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
+            )
         else:
-            ja_prob, ru_prob = 50.0, 50.0
-        chosen = 'ja' if ja_prob >= ru_prob else 'ru'
+            lang1_prob, lang2_prob, is_confident = 50.0, 50.0, False
+
+        if detected_lang and detected_lang not in {lang1, lang2}:
+            chosen = detected_lang
+            lang1_prob, lang2_prob = 0.0, 0.0
+        else:
+            chosen = lang1 if lang1_prob >= lang2_prob else (lang2 or lang1)
 
         if progress_callback:
             progress_callback(50)
@@ -535,7 +606,7 @@ def transcribe_range(
 
         texts: list[str] = []
         for seg in segments_gen:
-            t = clean_hallucination(seg.text.strip())
+            t = seg.text.strip()
             if t:
                 texts.append(t)
 
@@ -544,47 +615,39 @@ def transcribe_range(
 
         full_text = ' '.join(texts).strip()
 
-        # キリル文字が混入していて JA 判定だった場合は RU で再転写
-        ru_chars = sum(1 for c in full_text if '\u0400' <= c <= '\u04ff')
-        if ru_chars > 0 and chosen == 'ja':
-            ru_gen, _ = model.transcribe(
-                audio_arr,
-                language='ru',
-                multilingual=False,
-                beam_size=beam_size,
-                no_speech_threshold=no_speech_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                temperature=0.0,
-                word_timestamps=False,
-            )
-            ru_texts = [clean_hallucination(s.text.strip()) for s in ru_gen if s.text.strip()]
-            if ru_texts:
-                full_text = ' '.join(ru_texts).strip()
-                chosen = 'ru'
-                ru_prob = max(ru_prob, 92.0)
-                ja_prob = 100.0 - ru_prob
+        # スクリプト補強は削除済み。選出された言語で得られた転写結果を使用。
 
-        text_ja = full_text if chosen == 'ja' else ''
-        text_ru = full_text if chosen == 'ru' else ''
+        text_lang1 = full_text if chosen == lang1 else ''
+        text_lang2 = full_text if (lang2 and chosen == lang2) else ''
 
         if status_callback:
             status_callback('部分再文字起こし: 完了')
         if progress_callback:
             progress_callback(95)
 
+        if debug_prob_log:
+            logger.info(
+                f'[PROB_DEBUG_RANGE] start={start_sec:.3f} end={end_sec:.3f} '
+                f'lang1={lang1} lang2={lang2 or "-"} p1={lang1_prob:.1f} p2={lang2_prob:.1f} '
+                f'chosen={chosen} text="{full_text[:60]}"'
+            )
+
         logger.debug(
             f'[RANGE] start={start_sec:.3f} end={end_sec:.3f} chosen={chosen} '
-            f'ja_prob={ja_prob:.1f} ru_prob={ru_prob:.1f} text=\'{full_text[:60]}\''
+            f'{lang1}_prob={lang1_prob:.1f} {lang2 or "-"}_prob={lang2_prob:.1f} '
+            f'text=\'{full_text[:60]}\''
         )
 
         return {
             'start': start_sec,
             'end': end_sec,
             'text': full_text,
-            'text_ja': text_ja,
-            'text_ru': text_ru,
-            'ja_prob': ja_prob,
-            'ru_prob': ru_prob,
+            'text_lang1': text_lang1,
+            'text_lang2': text_lang2,
+            'lang1_prob': lang1_prob,
+            'lang2_prob': lang2_prob,
+            'lang1_code': lang1,
+            'lang2_code': lang2,
             'chosen_language': chosen,
             'device_fallback': device_fallback,
         }

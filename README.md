@@ -111,7 +111,7 @@ python main.py
 |------|--------|------|
 | TXT | `.txt` | `[HH:MM:SS.mmm -> HH:MM:SS.mmm] [JA:xx.xx%] [RU:yy.yy%] JA=... | RU=...` 行列 |
 | SRT | `.srt` | 標準 SRT。優勢 (確率が高い) 言語テキストを採用。連番 + 時刻範囲 + 本文 |
-| JSON | `.json` | 全セグメントを 1 つの JSON オブジェクトに集約。`{"segments": [...], "metadata": {...}}` のような形で、各セグメント要素は `start,end,text,text_ja,text_ru,ja_prob,ru_prob,chosen_language` 等を保持 |
+| JSON | `.json` | 全セグメントを 1 つの JSON オブジェクトに集約。`{"segments": [...], "metadata": {...}}` のような形で、各セグメント要素は `start,end,text,text_lang1,text_lang2,lang1_prob,lang2_prob,lang1_code,lang2_code,chosen_language` 等を保持 |
 
 ---
 ## 8. 設定 (`config.toml`)
@@ -122,8 +122,8 @@ device = "cuda"                    # cpu / cuda
 model = "large-v3"                 # large-v3 / distil-large-v3
 default_languages = ["ja", "ru"]
 
-ja_weight = 0.50
-ru_weight = 0.50
+lang1_weight = 0.50
+lang2_weight = 0.50
 
 no_speech_threshold = 0.6          # 無音スキップ感度
 initial_prompt = ""                # 認識ヒント文
@@ -137,7 +137,51 @@ vad_min_silence_ms = 2000
 別プリセット `[kapra]` などを追加して GUI で切替可。
 
 ---
-## 9. トラブルシュート
+## 9. ⚠️ 言語組み合わせの注意事項
+
+言語選択は99言語に対応していますが、**組み合わせによって精度が大幅に下がる**ケースがあります。
+
+### 9.1 スクリプト共有ペア
+
+本ツールはスクリプト文字そのものによる自動確率補正を行いません。選択した両言語が**同じスクリプト**を使う場合は、文字情報による区別ができないため、音響特徴や語彙に依存した判定になります。
+
+| 言語組み合わせ | 共有スクリプト | 備考 |
+|---|---|---|
+| JA + ZH (日中) | CJK文字（漢字）| ひらがな・カタカナが出現すればJA確定。漢字のみのテキストは区別困難 |
+| RU + UK / BG / SR / MK / BE (露+キリル圏) | キリル文字 | 全言語がキリル文字使用。文字情報での区別は困難 |
+| AR + FA / UR / PS / SD (アラビア語+アラビア文字圏) | アラビア文字 | 類似文字体系で文字情報による区別は困難 |
+| HE + YI (ヘブライ語+イディッシュ) | ヘブライ文字 | 文字情報での区別は困難 |
+| ZH + YUE (中国語+広東語) | CJK文字 | ほぼ同一スクリプト。音響特徴のみで判定 |
+
+**対策:** 上記の組み合わせでは `lang1_weight`/`lang2_weight` を手動調整するか、優勢言語を単独指定してください。
+
+### 9.2 ラテン文字ペア (スクリプト検出不可)
+
+EN, FR, DE, ES, PT, IT, NL, PL, CS, RO, など多くのヨーロッパ言語はラテン文字を使用します。これらを組み合わせると**スクリプト検出が一切働かず**、確率推定のみで判定します。
+
+| 例 | 備考 |
+|---|---|
+| EN + FR | どちらもラテン文字。語彙・音響特徴のみで判定 |
+| DE + NL | 非常に近縁。精度低下の可能性大 |
+| ES + PT | 類似語彙多数。短文では混乱しやすい |
+
+**対策:** 近縁言語の組み合わせは避け、単独指定を推奨します。どちらかを `なし` に設定してください。
+
+### 9.3 推奨される組み合わせ
+
+スクリプトが明確に異なる言語ペアは高精度で動作します:
+
+| ペア | 理由 |
+|---|---|
+| JA + RU (デフォルト) | ひらがな/カタカナ vs キリル文字で明確に区別 |
+| JA + EN | CJK/かな vs ラテン文字 |
+| ZH + EN | CJK vs ラテン文字 |
+| AR + EN | アラビア文字 vs ラテン文字 |
+| KO + EN | ハングル vs ラテン文字 |
+| TH + EN | タイ文字 vs ラテン文字 |
+
+---
+## 10. トラブルシュート
 | 症状 | 主原因候補 | 対処 |
 |------|------------|------|
 | `ctranslate2.dll` が読み込めない | ROCm/CUDA ランタイム未インストール | 下記「11.1 CTranslate2 DLL依存関係エラー」参照 |
@@ -233,12 +277,12 @@ rebuild_diff = true
 出力例:
 ```
 12:34:56 [DEBUG] main: [DIFF][rebuild] +0 -0 modified=1
-12:34:56 [DEBUG] main: [DIFF][detail] row 12: end:14.32->14.56, text_ja:旧->新
+12:34:56 [DEBUG] main: [DIFF][detail] row 12: end:14.32->14.56, text_lang1:旧->新
 ```
 意味:
 - `+N` 追加行数 / `-N` 削除行数
 - `modified=M` 変更行 (最大 10 行まで詳細)
-- `row i:` start / end / text_ja / text_ru / lang の差分一覧
+- `row i:` start / end / text_lang1 / text_lang2 / lang の差分一覧
 
 #### (C) 分割/結合再文字起こし監視 (ウォッチドッグ)
 `[再解析中]` プレースホルダが既定 (15 秒) 超えて残る場合は内部ウォッチドッグがチェックします。
@@ -249,16 +293,16 @@ rebuild_diff = true
 3. 既存ログはローテーション設定で整理
 
 ---
-## 10. パフォーマンス
+## 11. パフォーマンス
 小規模モデル選択または GPU 利用で処理速度が大幅に向上します。
 
 ---
-## 11. ライセンス
+## 12. ライセンス
 - faster-whisper (MIT) https://github.com/SYSTRAN/faster-whisper
 - 本ツール: ライセンス未記載（必要なら `LICENSE` 追加推奨: MIT など）
 
 ---
-## 12. 開発について
+## 13. 開発について
 
 このプロジェクトの内部アーキテクチャ、セグメントデータ構造、モジュール詳細については [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
 

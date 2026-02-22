@@ -14,11 +14,13 @@
   "start": 12.345,              // 秒単位の開始時刻
   "end": 15.678,                // 秒単位の終了時刻
   "text": "表示用(選択言語)",     // GUI / 書き出し時の表示テキスト
-  "text_ja": "日本語候補",       // 日本語テキスト（Whisper認識結果）
-  "text_ru": "ロシア語候補",     // ロシア語テキスト（Whisper認識結果）
-  "ja_prob": 72.13,             // 日本語確率 (%)
-  "ru_prob": 24.91,             // ロシア語確率 (%)
-  "chosen_language": "ja"        // 優勢言語 ("ja" | "ru" | null)
+  "text_lang1": "言語1候補",     // 言語1テキスト（Whisper認識結果）
+  "text_lang2": "言語2候補",     // 言語2テキスト（Whisper認識結果）
+  "lang1_prob": 72.13,          // 言語1確率 (%)
+  "lang2_prob": 24.91,          // 言語2確率 (%)
+  "lang1_code": "ja",           // 言語1のISOコード
+  "lang2_code": "ru",           // 言語2のISOコード (null = 1言語モード)
+  "chosen_language": "ja"       // 優勢言語 ("ja" | "ru" | "other" | null)
 }
 ```
 
@@ -31,10 +33,12 @@ class Segment:
     start: float
     end: float
     text: str
-    text_ja: str
-    text_ru: str
-    ja_prob: float
-    ru_prob: float
+    text_lang1: str
+    text_lang2: str
+    lang1_prob: float
+    lang2_prob: float
+    lang1_code: str = "ja"
+    lang2_code: str = "ru"
     chosen_language: Optional[str] = None
     
     def to_dict(self) -> dict:
@@ -50,8 +54,9 @@ class Segment:
 ### 1.3 表示テキスト決定ロジック
 `text` フィールドは `utils/segment_utils.py` の `display_text()` で決定：
 
-- `chosen_language` が "ja" → `text_ja` を採用
-- `chosen_language` が "ru" → `text_ru` を採用
+- `chosen_language` が lang1_code と一致 → `text_lang1` を採用
+- `chosen_language` が lang2_code と一致 → `text_lang2` を採用
+- `chosen_language` が "other" / 不明 → `text` (気険変換) を利用
 - 両方が空 → `"[ギャップ]"`
 
 このロジックにより、セグメント編集時に選択言語に応じた表示が自動更新されます。
@@ -60,8 +65,8 @@ class Segment:
 `transcription/processor.py` で Whisper の多言語確率から算出：
 
 ```python
-ja_prob = logits["ja"] / (logits["ja"] + logits["ru"]) * 100
-ru_prob = logits["ru"] / (logits["ja"] + logits["ru"]) * 100
+lang1_prob = logits[lang1] / (logits[lang1] + logits.get(lang2, 0)) * 100
+lang2_prob = logits.get(lang2, 0) / (logits[lang1] + logits.get(lang2, 0)) * 100
 ```
 
 ---
@@ -75,7 +80,7 @@ ru_prob = logits["ru"] / (logits["ja"] + logits["ru"]) * 100
 | **UI (メイン)** | `ui/app.py` | GUI 本体。再生・編集・スレッド管理 |
 | **テーブル表示** | `ui/table_presenter.py` | テーブル更新・集約テキスト再構築 |
 | **編集ダイアログ** | `ui/edit_dialog.py` | セグメントのテキスト編集・分割ダイアログ |
-| **隠し設定ダイアログ** | `ui/hidden_params_dialog.py` | 詳細パラメータの編集 |
+| **上級者向け設定ダイアログ** | `ui/hidden_params_dialog.py` | 詳細パラメータの編集 |
 | **文字起こし (メイン)** | `transcription/processor.py` | Whisper + VAD + 言語判定 |
 | **マルチスレッド** | `transcription/threads.py` | `TranscriptionThread` / `RangeTranscriptionThread` |
 | **モデルキャッシュ** | `transcription/model_cache.py` | モデルの事前ロード・保持 |
@@ -149,13 +154,13 @@ RangeTranscriptionThread スタート
 def split_segment_at_position(
     segment: Segment,
     position: float,  # 秒
-    text_ja: str = None,
-    text_ru: str = None
+    text_lang1: str = None,
+    text_lang2: str = None
 ) -> tuple[Segment, Segment]:
     """
     1 つのセグメントをカーソル位置で 2 分割。
     
-    JA / RU テキスト長の比率でタイミングを按分。
+    lang1 / lang2 テキスト長の比率でタイミングを按分。
     """
     ...
 ```

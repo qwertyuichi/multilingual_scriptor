@@ -1,18 +1,21 @@
 """Segment データクラス / ユーティリティ。
 
-目的: 既存の dict ベースセグメントとの互換ラッパ。
+目的: dict ベースセグメントとの互換ラッパ。
 
-満たす要件:
- - 属性: start, end, text, text_ja, text_ru, chosen_language, id, ja_prob, ru_prob, gap
- - dict 互換アクセス: `seg['start']` / `seg.get('start')`
- - `to_dict()` : 純粋な辞書へ変換 (JSON シリアライズ用)
- - `from_dict()` : 既存辞書から生成
- - `update(mapping)` : まとめて属性更新 (従来の `old.update({...})` 互換)
-
-将来拡張 (例): confidence, notes などのメタ情報追加時の集約ポイント。
+フィールド:
+ - start, end      : タイムスタンプ (秒)
+ - text            : 表示用テキスト (chosen_language 優先)
+ - text_lang1      : 第1言語テキスト
+ - text_lang2      : 第2言語テキスト
+ - chosen_language : 選択言語コード ('ja', 'ru', 'silence', 'other', ...) または None
+ - lang1_code      : 転写時の第1言語コード (デフォルト 'ja')
+ - lang2_code      : 転写時の第2言語コード (デフォルト 'ru'、単言語モードは '')
+ - lang1_prob      : 第1言語確率 (%)
+ - lang2_prob      : 第2言語確率 (%)
+ - gap             : True なら無音ギャップ扱い (silence と同義)
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields as dc_fields
 from typing import Any, Dict, Iterable
 
 __all__ = ["Segment", "as_segment_list"]
@@ -22,24 +25,25 @@ class Segment:
     start: float
     end: float
     text: str = ""
-    text_ja: str = ""
-    text_ru: str = ""
+    text_lang1: str = ""
+    text_lang2: str = ""
     chosen_language: str | None = None
     id: int | str | None = None
-    ja_prob: float = 0.0
-    ru_prob: float = 0.0
+    lang1_prob: float = 0.0
+    lang2_prob: float = 0.0
+    lang1_code: str = "ja"
+    lang2_code: str = "ru"
     gap: bool = False
 
     # --- dict 互換 API ---
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-    # JSON 書き出し等でそのまま扱えるように
-    def __iter__(self):  # allows dict(seg)
+    def __iter__(self):
         for k, v in asdict(self).items():
             yield k, v
 
-    def get(self, key: str, default: Any = None) -> Any:  # seg.get("start") 互換
+    def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
     def __getitem__(self, key: str) -> Any:
@@ -55,9 +59,15 @@ class Segment:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Segment":
-        fields = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore
-        init_kwargs = {k: data.get(k) for k in fields}
-        return cls(**init_kwargs)  # type: ignore[arg-type]
+        known = {f.name for f in dc_fields(cls)}
+        kwargs: Dict[str, Any] = {}
+        for f in dc_fields(cls):
+            if f.name in data:
+                kwargs[f.name] = data[f.name]
+        # start/end は必須: None なら 0.0 に補正 (BUG-29)
+        kwargs["start"] = float(kwargs.get("start") or 0.0)
+        kwargs["end"]   = float(kwargs.get("end")   or 0.0)
+        return cls(**kwargs)
 
 
 def as_segment_list(items: Iterable[Dict[str, Any] | Segment]) -> list[Segment]:
