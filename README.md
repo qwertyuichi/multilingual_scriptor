@@ -17,6 +17,34 @@ Whisper（faster-whisper）を使用して音声認識を行い、最大2言語�
 
 ---
 
+## 使用例
+
+以下は本アプリの実使用例です。動画再生に連動して、確認から編集、再解析、書き出しまでの一連の操作をインタラクティブに行えます。
+
+主な操作は次のとおりです：
+- セグメントの確認・選択
+    - テーブル行をクリックすると該当位置へシークし、再生位置に自動追従します。
+- テキスト編集
+    - 行ダブルクリックで編集ダイアログを開き、言語ごとのテキストを修正・分割できます。
+- セグメント操作
+    - 分割／結合／境界移動をGUIで実行し、変更後は部分再文字起こしが自動で実行されます。
+- 書き出し・抽出
+    - 編集したスクリプトと分割した音声の抽出が行えます。
+
+
+下の動画は上の操作を実際に行っている様子です。<small>（音声だけの認識です。動画中の字幕情報は使用していません。）</small>
+<p align="left">
+  <video src="docs/movies/example_ja_ru_kapra.mp4" controls style="width:50%; max-width:1010px;">
+    動画が再生できない場合は <a href="docs/movies/example_ja_ru_kapra.mp4">こちら</a> を開いてください。
+  </video>
+</p>
+
+<p align="left">Source: <a href="https://youtu.be/EtEUGILzs2s?si=D5xSs9ZMzx6IIyan">【JP/RU】「起きて！」って日本語とロシア語で？～二カ国語を喋る幼馴染がことわざを言いながら起こしてくる朝～ </a></p> 
+<p>Used with permission from <a href="https://www.youtube.com/@kapra_kazami">@kapra_kazami</a>.</p>
+
+
+---
+
 ## 動作環境
 
 - GPU推奨（NVIDIA CUDA または AMD ROCm）
@@ -276,6 +304,7 @@ GUI右下の「高度な設定...」ボタンから、以下を調整できま�
 <p align="left">
   <img src="docs/images/quadlang_example.png" alt="複数言語の例" style="width:75%; max-width:1000px;" />
 </p>
+
 <p align="left"><small>使用した動画: <a href="https://wikitongues.org/videos/mario_20161021_eng-cmn-jpn-por/">Wikitongues — Mario speaking English, Mandarin, Japanese, and Portuguese</a></small></p>
 
 - このテストでは英語（EN）と日本語（JA）に加えて、中国語（ZH）とポルトガル語（PT）も認識しています。
