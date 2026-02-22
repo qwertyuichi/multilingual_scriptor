@@ -33,6 +33,7 @@ def display_text(seg: Dict[str, Any]) -> str:
     lang2_code = seg.get("lang2_code", "ru")
     t1 = seg.get("text_lang1", "") or ""
     t2 = seg.get("text_lang2", "") or ""
+    base = seg.get('text', '') or ''
     p1 = seg.get("lang1_prob", 0.0) or 0.0
     p2 = seg.get("lang2_prob", 0.0) or 0.0
     if chosen and chosen not in {lang1_code, lang2_code, 'other', 'silence'}:
@@ -48,7 +49,14 @@ def display_text(seg: Dict[str, Any]) -> str:
         return t1
     if chosen == lang2_code and t2:
         return t2
-    # fallback
+    # If the chosen language's language-specific field is empty but the
+    # generic `text` field contains content (e.g. forced re-recognition
+    # updated only `text`), prefer that as a sensible fallback so the
+    # UI doesn't display an empty line.
+    if base:
+        return base
+
+    # fallback to whichever lang text is available
     if p1 >= p2:
         return t1 or t2
     return t2 or t1

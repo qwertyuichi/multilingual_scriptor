@@ -40,8 +40,16 @@ def dynamic_time_split(segments: List[dict], row_index: int, current_time_sec: f
             base_text = text_lang1; which = 'lang1'
         else:
             base_text = text_lang2; which = 'lang2'
+    # Fallback: if specific language fields are empty but a generic 'text' exists,
+    # use it as the basis for position calculation. This covers cases where a
+    # forced re-recognition updated 'text' but not 'text_lang1'/'text_lang2'.
     if not base_text:
-        return None, None
+        fallback_text = seg.get('text', '')
+        if fallback_text:
+            base_text = fallback_text
+            which = 'text'
+        else:
+            return None, None
     # 文字位置計算
     ratio = (current_time_sec - start) / max(1e-9, (end - start))
     pos = int(len(base_text) * ratio)
@@ -82,9 +90,11 @@ def merge_contiguous_segments(segments: List[dict], indices: List[int]) -> Tuple
         return None, None, None
     # Build merged placeholder segment (id: keep first's id)
     first = selected[0]
+    # Concatenate text from selected segments
+    merged_text = ' '.join([s.get('text', '').strip() for s in selected if s.get('text')])
     placeholder = Segment(
         start=start, end=end,
-        text='', text_lang1='', text_lang2='',
+        text=merged_text, text_lang1='', text_lang2='',
         chosen_language=None,
         id=first.get('id', idx_sorted[0]),
         lang1_prob=0.0, lang2_prob=0.0,

@@ -20,8 +20,11 @@ def rebuild_aggregate_text(result: Dict[str, Any]) -> None:
     lines: list[str] = []
     for s in segs:
         dt = display_text(s)
-        # dict へ戻す際も text 更新しておく (GAP なら空文字)
-        s['text'] = dt
+        # dict へ戻す際も表示テキストで上書きするが、空文字で既存の
+        # `text` を不意に消さないようにする。空の場合は既存の `text`
+        # を保持する。
+        if dt:
+            s['text'] = dt
         if dt:
             lines.append(dt)
     # 反映

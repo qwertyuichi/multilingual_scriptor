@@ -149,12 +149,23 @@ available_languages = [
 
 # ---- 確率デバッグ ----
 # クリップごとの確率ログを出力 (INFO)
-debug_prob_log = false
+debug_prob_log = true
 
 # ---- ログ設定 (advanced.logging に移動) ----
+phase1_beam_size = 5
+phase2_detect_beam_size = 1
+phase2_retranscribe_beam_size = 5
+ambiguous_threshold = 70.0
+condition_on_previous_text = true
+compression_ratio_threshold = 2.4
+log_prob_threshold = -1.0
+repetition_penalty = 1.0
+speech_pad_ms = 400
+duplicate_merge = true
+
 [advanced.logging]
 # ファイルログ(app.log)出力
-file_enabled = false
+file_enabled = true
 # ログレベル
 level = "INFO"
 # ログ出力パス

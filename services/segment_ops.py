@@ -39,7 +39,16 @@ def split_segment_at_position(segments: list[dict], index: int, which: str, pos:
     seg = segs[index]
     text_lang1 = seg.get('text_lang1', '')
     text_lang2 = seg.get('text_lang2', '')
-    base = text_lang1 if which == 'lang1' else text_lang2
+    # Support splitting based on the generic `text` field when a forced
+    # re-recognition updated only `text` but not language-specific fields.
+    if which == 'lang1':
+        base = text_lang1
+    elif which == 'lang2':
+        base = text_lang2
+    elif which == 'text':
+        base = seg.get('text', '')
+    else:
+        base = ''
     if not base or pos <= 0 or pos >= len(base):
         return segments
     start = float(seg.get('start', 0.0)); end = float(seg.get('end', start))

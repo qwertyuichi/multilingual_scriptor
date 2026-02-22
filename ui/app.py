@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+import gc
 import tomllib as _toml
 
 try:
@@ -376,10 +377,10 @@ class VideoTranscriptionApp(QMainWindow):
         toolbar.addWidget(self.stop_button)
 
         # Seek buttons
-        self.seek_back_10_btn = make_seek_btn("◀10s", -10000, "10秒戻る")
-        self.seek_back_1_btn  = make_seek_btn("◀1s",  -1000,  "1秒戻る")
-        self.seek_fwd_1_btn   = make_seek_btn("1s▶",   1000,  "1秒進む")
-        self.seek_fwd_10_btn  = make_seek_btn("10s▶", 10000,  "10秒進む")
+        self.seek_back_10_btn = make_seek_btn("◀ 10s", -10000, "10秒戻る")
+        self.seek_back_1_btn  = make_seek_btn("◀ 1s",  -1000,  "1秒戻る")
+        self.seek_fwd_1_btn   = make_seek_btn("1s ▶",   1000,  "1秒進む")
+        self.seek_fwd_10_btn  = make_seek_btn("10s ▶", 10000,  "10秒進む")
         for btn in (self.seek_back_10_btn, self.seek_back_1_btn, self.seek_fwd_1_btn, self.seek_fwd_10_btn):
             toolbar.addWidget(btn)
 
@@ -1010,8 +1011,7 @@ class VideoTranscriptionApp(QMainWindow):
                       and all(0 <= r < len(segs) for r in rows)):
                     can_dyn = True
             self.dynamic_split_button.setEnabled(can_dyn)
-        if hasattr(self, 'delete_button'):
-            self.delete_button.setEnabled(bool(rows) and not busy and bool(segs))
+        # delete_button removed; no longer present in UI
 
     def _start_watchdog(self) -> None:
         """ウォッチドッグタイマーを (再)起動する。"""
@@ -1141,13 +1141,20 @@ class VideoTranscriptionApp(QMainWindow):
         act_edit    = menu.addAction("このテキストを編集")
         act_re      = menu.addAction("これらの結合＆再文字起こし")
         act_dynamic = menu.addAction("現在位置で分割＆再文字起こし")
-        act_delete  = menu.addAction("選択行を削除")
+        # '選択行を削除' action removed per feature removal request
         
         menu.addSeparator()
         act_set_silence = menu.addAction("無音に設定")
-        act_retrans_lang1 = menu.addAction(f"{self.lang1_combo.currentData() or 'LANG1'}で強制再認識")
+        # Show language names in Japanese if available (e.g. 日本語 / 英語)
+        lang1_code = self.lang1_combo.currentData() or 'ja'
+        lang1_name = WHISPER_LANGUAGES_JA.get(lang1_code, WHISPER_LANGUAGES.get(lang1_code, lang1_code))
+        act_retrans_lang1 = menu.addAction(f"{lang1_name}で強制再認識")
         lang2 = self.lang2_combo.currentData()
-        act_retrans_lang2 = menu.addAction(f"{lang2 or 'LANG2'}で強制再認識") if lang2 else None
+        if lang2:
+            lang2_name = WHISPER_LANGUAGES_JA.get(lang2, WHISPER_LANGUAGES.get(lang2, lang2))
+            act_retrans_lang2 = menu.addAction(f"{lang2_name}で強制再認識")
+        else:
+            act_retrans_lang2 = None
 
         # 進行中はすべて無効
         if getattr(self, 'range_retranscribing', False):
@@ -1183,9 +1190,7 @@ class VideoTranscriptionApp(QMainWindow):
         if not self._can_retranscribe_selection(rows):
             act_re.setEnabled(False)
 
-        # 削除
-        if not rows:
-            act_delete.setEnabled(False)
+        # 削除 action removed; nothing to enable/disable here
 
         # 無音に設定、LANG1/LANG2強制再認識: 選択行があれば可能
         if not rows or not all(0 <= r < len(segs) for r in rows):
@@ -1215,8 +1220,7 @@ class VideoTranscriptionApp(QMainWindow):
         elif chosen == act_re and act_re.isEnabled():
             self.retranscribe_selected()
 
-        elif chosen == act_delete and act_delete.isEnabled():
-            self.delete_selected_segments()
+        # '選択行を削除' removed — no-op placeholder kept intentionally
 
         elif chosen == act_set_silence and act_set_silence.isEnabled():
             self.set_segments_silence(rows)
@@ -1247,7 +1251,7 @@ class VideoTranscriptionApp(QMainWindow):
         self._open_edit_dialog_for_row(r)
 
     def _open_edit_dialog_for_row(self, row: int) -> None:
-        """指定行の EditDialog を開き、結果を transcription_result に反映する。"""
+        """指定行の EditDialog を開き、テキスト編集結果を transcription_result に反映する。"""
         if not self.transcription_result:
             return
         segs = self.transcription_result.get('segments', [])
@@ -1262,17 +1266,21 @@ class VideoTranscriptionApp(QMainWindow):
         if dlg.exec() != EditDialog.Accepted:
             return
 
-        if dlg.mode == 'split':
-            self.perform_segment_split(row, dlg.split_which, dlg.split_pos)
-
-        elif dlg.mode == 'edit':
-            seg['text_lang1'] = dlg.new_text_lang1
-            seg['text_lang2'] = dlg.new_text_lang2
-            seg['chosen_language'] = dlg.chosen_language
-            # 表示用 text も更新
-            seg['text'] = dlg.new_text_lang1 if dlg.chosen_language == lang1_code else dlg.new_text_lang2
-            self._rebuild_text_and_refresh()
-            self.status_label.setText("編集を保存しました")
+        # テキスト編集結果を反映
+        seg['text_lang1'] = dlg.new_text_lang1
+        seg['text_lang2'] = dlg.new_text_lang2
+        seg['chosen_language'] = dlg.chosen_language
+        # 選択した言語の認識率を100%、他方を0%に設定
+        if dlg.chosen_language == lang1_code:
+            seg['lang1_prob'] = 1.0
+            seg['lang2_prob'] = 0.0
+        else:
+            seg['lang1_prob'] = 0.0
+            seg['lang2_prob'] = 1.0
+        # 表示用 text も更新
+        seg['text'] = dlg.new_text_lang1 if dlg.chosen_language == lang1_code else dlg.new_text_lang2
+        self._rebuild_text_and_refresh()
+        self.status_label.setText("編集を保存しました")
 
     # ================================================================
     # 手動分割 / 境界調整 / 再文字起こし
@@ -1408,6 +1416,7 @@ class VideoTranscriptionApp(QMainWindow):
 
         segs_obj = as_segment_list(self.transcription_result.get('segments', []))
         target_index = base_row if kind == 'front' else base_row + 1
+        is_silence = False
         if 0 <= target_index < len(segs_obj):
             tgt = segs_obj[target_index]
             tgt.update({
@@ -1423,9 +1432,11 @@ class VideoTranscriptionApp(QMainWindow):
                     or tgt.get('chosen_language')
                 ),
             })
-            # テキストが両方空なら明示ラベル
-            if not tgt.text_lang1 and not tgt.text_lang2:
-                tgt.text = tgt.text_lang1 = tgt.text_lang2 = '(空)'
+            # テキストが両方空なら無音セグメント
+            is_silence = not tgt.text_lang1 and not tgt.text_lang2
+            if is_silence:
+                tgt.text = tgt.text_lang1 = tgt.text_lang2 = ''
+                tgt.chosen_language = 'silence'
                 tgt.lang1_prob = tgt.lang2_prob = 0.0
 
         try:
@@ -1433,11 +1444,15 @@ class VideoTranscriptionApp(QMainWindow):
         except Exception:
             pass
 
-        # 対象行のみ部分更新
-        try:
-            self._update_table_row(target_index, segs_obj[target_index])
-        except Exception:
+        # 無音セグメント確定時はテーブル全体再構築（前のテキストが残るのを防止）
+        if is_silence:
             self._rebuild_text_and_refresh()
+        else:
+            # 通常は対象行のみ部分更新
+            try:
+                self._update_table_row(target_index, segs_obj[target_index])
+            except Exception:
+                self._rebuild_text_and_refresh()
 
         # 次ジョブへ or 全完了
         if getattr(self, '_pending_rejobs', None):
@@ -1786,8 +1801,19 @@ class VideoTranscriptionApp(QMainWindow):
                     segs[row_idx]['lang2_prob'] = 100.0
                 
                 segs[row_idx]['text'] = result.get('text', '')
-                segs[row_idx]['text_lang1'] = result.get('text_lang1', '')
-                segs[row_idx]['text_lang2'] = result.get('text_lang2', '')
+                # transcribe_range() が単言語 [lang] で実行された場合、
+                # 結果の言語コードが UI側の言語構成と異なる場合があるため、正しいフィールドに割り当てる
+                lang1_code = self.lang1_combo.currentData() or 'ja'
+                lang2_code = self.lang2_combo.currentData()
+                result_lang1_code = result.get('lang1_code', 'ja')
+                
+                # 結果の lang1_code が UI側の lang2_code と一致する場合、フィールドを反転
+                if result_lang1_code == lang2_code:
+                    segs[row_idx]['text_lang1'] = result.get('text_lang2', '')
+                    segs[row_idx]['text_lang2'] = result.get('text_lang1', '')
+                else:
+                    segs[row_idx]['text_lang1'] = result.get('text_lang1', '')
+                    segs[row_idx]['text_lang2'] = result.get('text_lang2', '')
                 segs[row_idx]['chosen_language'] = lang
                 
                 self.transcription_result['segments'] = [s.to_dict() for s in segs]
@@ -2383,6 +2409,20 @@ class VideoTranscriptionApp(QMainWindow):
         are unloaded before the application exits. Shows a small waiting
         dialog while shutdown proceeds.
         """
+        # Stop media playback early to reduce active device usage
+        try:
+            try:
+                # prefer using our stop helper if available
+                self.stop_video()
+            except Exception:
+                # fallback: stop media player directly
+                try:
+                    self.media_player.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Collect running transcription threads
         threads = []
         if getattr(self, 'transcription_thread', None) and self.transcription_thread.isRunning():
@@ -2422,12 +2462,26 @@ class VideoTranscriptionApp(QMainWindow):
 
             dlg.close()
 
-        # Clear model cache now that threads are stopped
+        # Additional short wait and GC before clearing models
+        try:
+            QApplication.processEvents()
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # Clear model cache now that threads are stopped. Use GC pass
+        # afterwards to ensure native destructors run on the main thread.
         try:
             import transcription.model_cache as model_cache
             model_cache.clear_cache()
         except Exception:
             logger.exception('Failed to clear model cache during shutdown')
+
+        try:
+            gc.collect()
+            time.sleep(0.05)
+        except Exception:
+            pass
 
         super().closeEvent(event)
 
