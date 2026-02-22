@@ -34,10 +34,9 @@ Whisper（faster-whisper）を使用して音声認識を行い、最大2言語�
 
 下の動画は上の操作を実際に行っている様子です。<small>（音声だけの認識です。動画中の字幕情報は使用していません。）</small>
 <p align="left">
-  <video src="docs/movies/example_ja_ru_kapra.mp4" controls style="width:50%; max-width:1010px;">
-    動画が再生できない場合は <a href="docs/movies/example_ja_ru_kapra.mp4">こちら</a> を開いてください。
-  </video>
+https://github.com/user-attachments/assets/feee5da1-d80a-4634-8352-6a53fe646c51
 </p>
+
 
 <p align="left">Source: <a href="https://youtu.be/EtEUGILzs2s?si=D5xSs9ZMzx6IIyan">【JP/RU】「起きて！」って日本語とロシア語で？～二カ国語を喋る幼馴染がことわざを言いながら起こしてくる朝～ </a></p> 
 <p>Used with permission from <a href="https://www.youtube.com/@kapra_kazami">@kapra_kazami</a>.</p>
