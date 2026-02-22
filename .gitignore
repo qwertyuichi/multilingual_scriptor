@@ -44,6 +44,4 @@ whisper_cache/
 *.jsonl
 *.srt
 *.txt
-
-# 明示的に追跡したい特定ファイルがある場合は ! で除外解除する (例)
-!sample/*
+*.whl

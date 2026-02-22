@@ -2,7 +2,11 @@
 
 python main.py でアプリケーションを起動する。
 """
+import os
 import sys
+
+# OpenMP競合を回避（CPUモード実行時のクラッシュ防止）
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 from PySide6.QtCore import QLoggingCategory
 from PySide6.QtWidgets import QApplication

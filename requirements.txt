@@ -1,6 +1,2 @@
-openai-whisper
-torch
-numpy
-scipy
-webrtcvad
+faster-whisper
 PySide6
