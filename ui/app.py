@@ -883,9 +883,9 @@ class VideoTranscriptionApp(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_transcription)
         btn_row.addWidget(self.cancel_button)
         btn_row.addStretch()
-        self.hidden_params_button = QPushButton("上級者向け設定...")
+        self.hidden_params_button = QPushButton("高度な設定...")
         self.hidden_params_button.clicked.connect(self._open_hidden_params_dialog)
-        self.hidden_params_button.setToolTip("Phase別beam_sizeなど上級者向け設定を編集")
+        self.hidden_params_button.setToolTip("Phase別beam_sizeなど高度な設定を編集")
         btn_row.addWidget(self.hidden_params_button)
         transcribe_layout.addLayout(btn_row)
 
@@ -2032,11 +2032,11 @@ class VideoTranscriptionApp(QMainWindow):
             self.status_label.setText("書き出し失敗")
 
     # ================================================================
-    # 上級者向け設定
+    # 高度な設定
     # ================================================================
 
     def _open_hidden_params_dialog(self) -> None:
-        """上級者向け設定ダイアログを開き、設定を config.toml の [advanced] に保存する。"""
+        """高度な設定ダイアログを開き、設定を config.toml の [advanced] に保存する。"""
         # provide advanced (preferred) or fall back to legacy hidden section
         current_hidden = self.config.get("advanced", self.config.get("hidden", {}))
         
@@ -2090,7 +2090,7 @@ class VideoTranscriptionApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "保存完了",
-                    "上級者向け設定を config.toml の [advanced] セクションに保存しました。\n次回の文字起こしから反映されます。"
+                    "高度な設定を config.toml の [advanced] セクションに保存しました。\n次回の文字起こしから反映されます。"
                 )
                 logger.info(f"[ADVANCED] Updated advanced params: {new_values}")
                 
@@ -2099,7 +2099,7 @@ class VideoTranscriptionApp(QMainWindow):
                 QMessageBox.critical(
                     self,
                     "保存エラー",
-                    f"上級者向け設定の保存に失敗しました: {e}"
+                    f"高度な設定の保存に失敗しました: {e}"
                 )
     
     def _toml_value(self, val) -> str:

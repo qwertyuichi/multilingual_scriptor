@@ -1,4 +1,4 @@
-"""上級者向け設定ダイアログ。
+"""高度な設定ダイアログ。
 
 config.toml の [advanced] セクションを GUI から編集可能にします。
 """
@@ -28,11 +28,11 @@ from core.constants import WHISPER_LANGUAGES, WHISPER_LANGUAGES_JA
 
 
 class HiddenParamsDialog(QDialog):
-    """上級者向け設定編集ダイアログ。"""
+    """高度な設定編集ダイアログ。"""
 
     def __init__(self, current_hidden: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("上級者向け設定")
+        self.setWindowTitle("高度な設定")
         # Reduce minimum height so dialog can shrink to fit content
         self.setMinimumSize(980, 594)
         
@@ -70,7 +70,7 @@ class HiddenParamsDialog(QDialog):
 
         # 説明ラベル
         info = QLabel(
-            "上級者向けパラメータです。変更後は「適用」を押すと config.toml の [advanced] セクションに保存されます。"
+            "高度なパラメータです。変更後は「適用」を押すと config.toml の [advanced] セクションに保存されます。"
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #888; margin-bottom: 10px; }")

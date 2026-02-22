@@ -1,49 +1,49 @@
-<br>
-
 # Multilingual Scriptor
 
-**多言語対応動画文字起こし & セグメント編集 GUI**
+動画・音声ファイルの多言語文字起こしと編集を行うデスクトップアプリケーションです。
 
-Whisper ベースで動画を文字起こしし、GUI 上で「再生」「シーク」「セグメント編集 (分割/結合/境界調整)」「部分再トランスクリプト」「書き出し (TXT / SRT / JSON)」を行うデスクトップツールです。複数言語の確率を保持しながら編集でき、日本語・ロシア語をはじめとした多言語コンテンツに対応します。
-
----
-## 1. 主な特徴
-| 分類 | 機能概要 |
-|------|----------|
-| 初回文字起こし | Whisper 指定モデルで全編を一括処理 (日露混在可) |
-| 動画再生連動 | 再生位置に合わせてテーブル選択が自動追従 (逆シークも可) |
-| セグメント編集 | テキスト編集 / カーソル位置で 2 分割 / 動的分割 / 2 行境界のドラッグ的調整 (時間位置で再計算) |
-| 逐次反映 | セグメント確定ごとにテーブルへ即時追加 (進捗件数表示) |
-| モデル最適化 | 初回全文開始時に部分再文字起こし用モデルを事前ロード (ウォームアップ) |
-| 再トランスクリプト | 分割直後 / 境界調整直後 / 指定範囲(行)などで部分再実行 (バックグラウンド Thread) |
-| 言語確率 | JA / RU 推定確率を保持し優勢言語表示 / 手動で表示言語選択も可能 |
-| 書き出し | TXT / SRT / JSON |
-| コンフィグ | `config.toml` でモデル/デバイス/閾値等プリセット切替 |
-| UI 操作性 | ダブルクリックで該当開始秒へ再生 / 選択行が 1 行と 2 行で挙動切替 |
+Whisper（faster-whisper）を使用して音声認識を行い、最大2言語が混在するコンテンツに対応します。GUI上で再生しながらセグメントの編集（分割・結合・境界調整）ができ、テキストや音声の書き出しが可能です。
 
 ---
-## 2. 画面概要
-左: 動画 + 再生コントロール / 右: セグメントテーブル & 編集操作パネル / 下部: ステータス & 進捗バー。テーブル列は概ね `START | END | LANG | JA_TEXT | RU_TEXT | JA% | RU% | FLAGS` のイメージ (実際の内部キーは `segments` リストに格納)。
+
+## 主な機能
+
+- 動画・音声ファイルの自動文字起こし（Whisper large-v3 / distil-large-v3）
+- 2言語混在コンテンツの同時認識と言語別確率表示
+- 動画再生とセグメントテーブルの連動（クリックでシーク、再生位置に応じた自動選択）
+- 複数形式での書き出し（TXT / SRT / JSON）
+- 音声書き出し（WAV / MP3）
+- VAD（Silero VAD）による音声区間の自動検出
 
 ---
-## 3. インストール
-### 3.1 前提
-- Python 3.11+ 
-- FFmpeg
-- **GPU 使用時（推奨）:** CUDA または ROCm が必要です。詳細は [CTranslate2 GitHub](https://github.com/OpenNMT/CTranslate2) を参照してください。
 
-> **注意:** CPU のみでも動作しますが、文字起こし速度が大幅に低下します。GPU環境を強く推奨します。
+## 動作環境
 
-### 3.2 依存パッケージ
-`requirements.txt`:
+- GPU推奨（NVIDIA CUDA または AMD ROCm）
+    - CPUでも動作しますが、文字起こし速度が大幅に低下します。
+
+## インストール
+
+### 1. GPU環境（推奨）
+
+[CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)をインストール
+
+**AMD GPU:**
+[ROCm SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)をインストール
+
+詳細は[CTranslate2のドキュメント](https://github.com/OpenNMT/CTranslate2)を参照してください。
+
+### 2. リポジトリのクローン
+
+```pwsh
+git clone https://github.com/qwertyuichi/multilingual_scriptor.git
+cd multilingual_scriptor
 ```
-faster-whisper
-PySide6
-```
 
-**注**: `faster-whisper` は内部で CTranslate2、Silero VAD、およびその他の依存パッケージ（av, onnxruntime, tokenizers, tqdm など）を使用しています。これらは `faster-whisper` のインストール時に自動的にインストールされます。
+### 3. Python環境のセットアップ
 
-インストール例 (Windows PowerShell):
+Windows（PowerShell使用）:
+
 ```pwsh
 python -m venv venv
 .\venv\Scripts\Activate.ps1
@@ -51,261 +51,325 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-#### FFmpeg のインストール
+### 4. FFmpegのインストール
 
-**Windows (winget 使用):**
+Windows（winget使用）:
+
 ```pwsh
 winget install ffmpeg
 ```
 
-インストール後、新しいターミナルを開いて確認:
+インストール後、新しいターミナルでPATHが通っているか確認：
+
 ```pwsh
 ffmpeg -version
 ```
 
-> **注意**: winget でインストールした場合、自動的に PATH が設定されます。PATH が通らない場合は、一度ターミナルを再起動してください。
-
 **その他の方法:**
-- [FFmpeg 公式サイト](https://ffmpeg.org/download.html) からダウンロードして手動でインストール
+- [FFmpeg公式サイト](https://ffmpeg.org/download.html)からダウンロード
 - Chocolatey: `choco install ffmpeg`
 - Scoop: `scoop install ffmpeg`
 
-### 3.3 GPU環境のセットアップ
-
-GPU を使用する場合、CUDA または ROCm が必要です。詳細なセットアップ手順については、[CTranslate2 GitHub](https://github.com/OpenNMT/CTranslate2) を参照してください。
-
 ---
-## 4. 起動
+
+## 起動
+
 ```pwsh
 python main.py
 ```
-初回起動時に `config.toml` の `[default]` セクション値を GUI へ反映します。別プリセット (例: `[kapra]`) へ切替する UI がある場合はそちらから再読込できます。
+
+初回起動時は `config.toml` の `[default]` セクションの設定が読み込まれます。
 
 ---
-## 5. 基本操作フロー
-1. 右上/上部の「動画を開く」ボタンで MP4 等を選択
-2. 「文字起こし開始」を押下 → モデル読み込み & 全体セグメント生成
-3. 再生しながら内容確認（テーブル行クリックでシーク）
-4. 必要に応じて編集: 
-   - 1 行選択 + ボタン: 現在再生位置で動的分割 → 分割後 2 区間を自動で再トランスクリプト
-   - 2 行連続選択 + ボタン: 両行境界を現在再生位置へ移動 → 双方を再トランスクリプト
-   - 行ダブルクリック: 詳細編集ダイアログ (JA/RU テキスト編集 / カーソル分割)
-  - 不要行選択 → 削除: セグメントを物理削除
-5. エクスポート: 書き出し形式 (TXT / SRT / JSON) を選んで保存
+
+## 基本的な使い方
+
+### 1. 動画ファイルを開く
+
+「動画を開く」ボタンで動画・音声ファイルを選択します。
+
+### 2. 文字起こしの実行
+
+1. 言語を選択（最大2言語）
+2. モデルとデバイス（CPU/CUDA）を選択
+3. 「文字起こし開始」ボタンをクリック
+
+処理中はセグメントが順次テーブルに追加されます。
+
+### 3. 再生と確認
+
+- 再生ボタンで動画を再生
+- テーブルの行をクリックするとその位置にシーク
+- 再生位置に応じてテーブルの選択が自動で移動
+
+### 4. セグメントの編集
+
+**テキストの修正:**
+- 行をダブルクリックして編集ダイアログを開く
+- 言語を切り替えてテキストを修正
+
+**セグメントの分割:**
+- 1行を選択して再生位置を調整
+- 「分割」ボタンで現在位置で分割
+- 分割後、自動的に再文字起こしが実行される
+
+**境界の調整:**
+- 連続する2行を選択して再生位置を調整
+- 「境界調整」ボタンで境界を移動
+- 調整後、自動的に再文字起こしが実行される
+
+**セグメントの削除:**
+- 行を選択して「削除」ボタンをクリック
+
+### 5. 書き出し
+
+**テキスト書き出し:**
+1. 書き出し形式を選択（TXT / SRT / JSON）
+2. 「テキスト書き出し」ボタンをクリック
+3. 保存先を指定
+
+**音声書き出し:**
+1. 形式を選択（WAV / MP3）
+2. 「音声書き出し」ボタンをクリック
+3. 保存先を指定
 
 ---
-## 6. セグメント編集詳細
-| 操作 | 条件 | 動作 |
-|------|------|------|
-| 行ダブルクリック | 任意行 | 編集ダイアログ (JA/RU 切替, テキスト修正, カーソル分割) |
-| 1 行選択 + 分割ボタン | 任意行 | 現在再生位置で 2 分割 (閾値未満の極小断片は拒否) |
-| 2 行連続選択 + 境界調整 | 任意行 | 境界を現在再生位置へ移動 (最小長確保) |
-| 複数行選択 + 削除 | 任意行 | セグメント削除 (番号再採番) |
-| カーソル分割 (編集ダイアログ) | テキスト内カーソル位置 | 言語別テキスト長比で開始/終了時間を線形割当 |
 
-再トランスクリプトは時間枠確定後に順次スレッドで実行され、完了ごとにテーブル更新。実行中は関連ボタンが無効化され進捗バーが進む。
+## 書き出し形式
+
+### TXT形式
+
+タイムスタンプと言語確率を含むプレーンテキスト形式：
+
+```
+[HH:MM:SS.mmm -> HH:MM:SS.mmm] [JA:xx.xx%] [RU:yy.yy%] JA=テキスト1 | RU=テキスト2
+```
+
+### SRT形式
+
+字幕ファイル標準形式。優勢言語（確率が高い方）のテキストを出力：
+
+```
+1
+00:00:00,000 --> 00:00:05,000
+テキスト内容
+```
+
+### JSON形式
+
+全セグメント情報を含む構造化データ：
+
+```json
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 5.0,
+      "text": "表示テキスト",
+      "text_lang1": "言語1テキスト",
+      "text_lang2": "言語2テキスト",
+      "lang1_prob": 85.5,
+      "lang2_prob": 14.5,
+      "lang1_code": "ja",
+      "lang2_code": "en",
+      "chosen_language": "ja"
+    }
+  ],
+  "metadata": { ... }
+}
+```
 
 ---
-## 7. 書き出し形式
-| 形式 | 拡張子 | 内容 |
-|------|--------|------|
-| TXT | `.txt` | `[HH:MM:SS.mmm -> HH:MM:SS.mmm] [JA:xx.xx%] [RU:yy.yy%] JA=... | RU=...` 行列 |
-| SRT | `.srt` | 標準 SRT。優勢 (確率が高い) 言語テキストを採用。連番 + 時刻範囲 + 本文 |
-| JSON | `.json` | 全セグメントを 1 つの JSON オブジェクトに集約。`{"segments": [...], "metadata": {...}}` のような形で、各セグメント要素は `start,end,text,text_lang1,text_lang2,lang1_prob,lang2_prob,lang1_code,lang2_code,chosen_language` 等を保持 |
 
----
-## 8. 設定 (`config.toml`)
-`[default]` 例:
+## 設定ファイル
+
+`config.toml` で各種パラメータを設定できます。
+
+### 基本設定例
+
 ```toml
 [default]
 device = "cuda"                    # cpu / cuda
 model = "large-v3"                 # large-v3 / distil-large-v3
+default_languages = ["ja", "en"]   # 起動時に選択する言語
+
+lang1_weight = 0.50                # 言語1スコアの補正係数
+lang2_weight = 0.50                # 言語2スコアの補正係数
+
+no_speech_threshold = 0.6          # 無音スキップ感度（0〜1）
+initial_prompt = ""                # 認識ヒント（固有名詞など）
+
+# VAD設定
+vad_filter = true                  # 音声区間の自動検出
+vad_threshold = 0.5                # 音声判定の閾値
+vad_min_speech_ms = 250            # 最小発話長
+vad_min_silence_ms = 2000          # セグメント区切りとする無音長
+```
+
+### プロファイルの追加
+
+複数の設定を切り替えて使用できます：
+
+```toml
+[custom_profile]
+device = "cuda"
+model = "large-v3"
 default_languages = ["ja", "ru"]
-
-lang1_weight = 0.50
-lang2_weight = 0.50
-
-no_speech_threshold = 0.6          # 無音スキップ感度
-initial_prompt = ""                # 認識ヒント文
-
-# VAD (音声区間の自動検出) - Silero VAD を使用
-vad_filter = true
-vad_threshold = 0.5
-vad_min_speech_ms = 250
-vad_min_silence_ms = 2000
-```
-別プリセット `[kapra]` などを追加して GUI で切替可。
-
----
-## 9. ⚠️ 言語組み合わせの注意事項
-
-言語選択は99言語に対応していますが、**組み合わせによって精度が大幅に下がる**ケースがあります。
-
-### 9.1 スクリプト共有ペア
-
-本ツールはスクリプト文字そのものによる自動確率補正を行いません。選択した両言語が**同じスクリプト**を使う場合は、文字情報による区別ができないため、音響特徴や語彙に依存した判定になります。
-
-| 言語組み合わせ | 共有スクリプト | 備考 |
-|---|---|---|
-| JA + ZH (日中) | CJK文字（漢字）| ひらがな・カタカナが出現すればJA確定。漢字のみのテキストは区別困難 |
-| RU + UK / BG / SR / MK / BE (露+キリル圏) | キリル文字 | 全言語がキリル文字使用。文字情報での区別は困難 |
-| AR + FA / UR / PS / SD (アラビア語+アラビア文字圏) | アラビア文字 | 類似文字体系で文字情報による区別は困難 |
-| HE + YI (ヘブライ語+イディッシュ) | ヘブライ文字 | 文字情報での区別は困難 |
-| ZH + YUE (中国語+広東語) | CJK文字 | ほぼ同一スクリプト。音響特徴のみで判定 |
-
-**対策:** 上記の組み合わせでは `lang1_weight`/`lang2_weight` を手動調整するか、優勢言語を単独指定してください。
-
-### 9.2 ラテン文字ペア (スクリプト検出不可)
-
-EN, FR, DE, ES, PT, IT, NL, PL, CS, RO, など多くのヨーロッパ言語はラテン文字を使用します。これらを組み合わせると**スクリプト検出が一切働かず**、確率推定のみで判定します。
-
-| 例 | 備考 |
-|---|---|
-| EN + FR | どちらもラテン文字。語彙・音響特徴のみで判定 |
-| DE + NL | 非常に近縁。精度低下の可能性大 |
-| ES + PT | 類似語彙多数。短文では混乱しやすい |
-
-**対策:** 近縁言語の組み合わせは避け、単独指定を推奨します。どちらかを `なし` に設定してください。
-
-### 9.3 推奨される組み合わせ
-
-スクリプトが明確に異なる言語ペアは高精度で動作します:
-
-| ペア | 理由 |
-|---|---|
-| JA + RU (デフォルト) | ひらがな/カタカナ vs キリル文字で明確に区別 |
-| JA + EN | CJK/かな vs ラテン文字 |
-| ZH + EN | CJK vs ラテン文字 |
-| AR + EN | アラビア文字 vs ラテン文字 |
-| KO + EN | ハングル vs ラテン文字 |
-| TH + EN | タイ文字 vs ラテン文字 |
-
----
-## 10. トラブルシュート
-| 症状 | 主原因候補 | 対処 |
-|------|------------|------|
-| `ctranslate2.dll` が読み込めない | ROCm/CUDA ランタイム未インストール | 下記「11.1 CTranslate2 DLL依存関係エラー」参照 |
-| ffmpeg が見つからない | PATH 未設定 | FFmpeg インストール & パス確認 (`ffmpeg -version`) |
-| GPU が使われない | CUDA/ROCm ドライバ不足 | ドライバ更新、GPU対応確認 (`nvidia-smi` / `rocm-smi`) |
-| 途中でフリーズ感 | 長時間モデル推論 | 進捗バー運用 / 小さいモデルへ変更 |
-| 再分割が無効 | 再生位置が端 / 最小長未満 | 再生位置を中央付近に調整 |
-| SRT 文字化け | エディタの文字コード | UTF-8 (BOM 無) で開く |
-| JSON が空 (segments が 0) | セグメントが GAP のみ / 全て除外 | GAP 変換し過ぎていないか確認 |
-
----
-### 11.1 CTranslate2 DLL依存関係エラー
-
-**エラー例:**
-```
-FileNotFoundError: Could not find module 'ctranslate2.dll' (or one of its dependencies)
+lang1_weight = 0.4
+lang2_weight = 0.6
+vad_min_silence_ms = 500           # より短い無音で区切る
 ```
 
-このエラーは `ctranslate2.dll` 自体は存在するが、**その依存DLLが見つからない**場合に発生します。
+GUIからプロファイルを選択して切り替えられます。
 
-#### 原因と対処法
+### 高度な設定
 
-**AMD ROCm GPU を使用している場合（最も一般的）**
+GUI右下の「高度な設定...」ボタンから、以下を調整できます。：
 
-ROCm版のCTranslate2は、AMD ROCmランタイムライブラリに依存します：
-- `amdhip64.dll`
-- `rocblas.dll`
-- その他のROCmコンポーネント
+- 言語判定設定
+    - beam_sizeを調整することで、文字認識の精度と速度のバランスを調整できます。
+    - (値が大きいほど精度は向上するが処理時間がかかる)
+- 言語候補
+    - デフォルトで候補に表示されない言語はこちらで有効化できます。
+- ログ設定
+    - ログの出力設定ができます。（デバッグ用）
+- その他
+    - 文字起こしのより細かい内部パラメータを調整することができます。（デバッグ用）
+
+いずれも、通常は変更する必要はありません。
+
+---
+
+## 言語選択の注意事項
+
+多言語に対応していますが、組み合わせによっては精度が低下する場合があります。
+
+
+**言語体系が異なる言語ペアは高精度で動作します：**
+- 日本語 + ロシア語
+- 日本語 + 英語
+
+など。
+
+
+
+**注意が必要な組み合わせ：**
+
+- 英語 + フランス語
+- ロシア語 + ウクライナ語
+
+など。これらの組み合わせでは、類似の音響特徴と語彙を共有するため、精度が低下します。
+
+**対策:**
+- 言語設定の重みを調整することで、精度向上が見込めます。
+
+---
+
+## 複数言語（3言語以上）について
+
+本ツールは内部で複数言語の確率を扱えますが、3言語以上が同一音声に混在する場合の自動判別は難しく、実運用で高い精度は期待できません。
+認識は可能ですが、短い発話や類似音が多い箇所で誤認識が増える点について留意してください。
+
+以下は４言語混在例のスクリーンショットです。
+
+
+<p align="left">
+  <img src="docs/images/quadlang_example.png" alt="複数言語の例" style="width:75%; max-width:1000px;" />
+</p>
+<p align="left"><small>使用した動画: <a href="https://wikitongues.org/videos/mario_20161021_eng-cmn-jpn-por/">Wikitongues — Mario speaking English, Mandarin, Japanese, and Portuguese</a></small></p>
+
+- このテストでは英語（EN）と日本語（JA）に加えて、中国語（ZH）とポルトガル語（PT）も認識しています。
+- 指定していない言語が検出される場合、出力スクリプトの先頭に `[ZH?]`, `[PT?]` のような疑問付きの言語タグが自動付与されます（例: `[ZH?] 大家你`）。
+- 実運用ではこれらのタグを手動確認して、必要に応じて表示言語を切り替えるかポストエディットしてください。
+
+
+
+
+## トラブルシューティング
+
+### CTranslate2のDLL読み込みエラー
+
+**症状:**
+```
+FileNotFoundError: Could not find module 'ctranslate2.dll'
+```
+
+**原因:**
+GPU用のランタイムライブラリが不足しています。
 
 **対処法:**
-1. [AMD ROCm SDK for Windows](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) をインストール
-2. システムを**再起動**（重要）
-3. 環境変数 `PATH` に ROCm の bin ディレクトリが追加されていることを確認
 
-**NVIDIA CUDA GPU を使用している場合**
+NVIDIA GPU使用時：
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)をインストール
 
-CUDA版のCTranslate2は、CUDAランタイムライブラリに依存します。
+AMD GPU使用時：
+- [ROCm SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)をインストール
+
+
+インストール後はシステムを再起動してください。
+
+### FFmpegが見つからない
+
+**症状:**
+FFmpeg関連のエラーが表示される。
 
 **対処法:**
-1. [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) をインストール
-2. システムを再起動
+1. FFmpegをインストール（上記参照）
+2. ターミナルを再起動
+3. `ffmpeg -version` で確認
 
-**その他の依存関係**
-
-Visual C++ Redistributables が不足している場合もあります。
+### GPUが使用されない
 
 **対処法:**
-```pwsh
-winget install Microsoft.VCRedist.2015+.x64
-```
+1. GPUドライバを最新版に更新
+2. CUDA/ROCmが正しくインストールされているか確認
+3. `config.toml` で `device = "cuda"` が設定されているか確認
 
-#### 診断方法
+### 処理が遅い
 
-不足している具体的なDLLを確認するには：
+**対処法:**
+- GPUを使用する（CPU使用時は非常に遅い）
+- より小さいモデルを選択（`distil-large-v3`）
+- VAD設定を調整して無音部分をスキップ
 
-```python
-import ctypes
-import os
+### 文字化けが発生する
 
-dll_path = r"D:\multilingual_scriptor\venv\Lib\site-packages\ctranslate2\ctranslate2.dll"
-os.add_dll_directory(os.path.dirname(dll_path))
-
-try:
-    ctypes.CDLL(dll_path)
-    print("✓ DLL読み込み成功")
-except OSError as e:
-    print(f"✗ エラー: {e}")
-```
+**対処法:**
+- テキストエディタでUTF-8（BOM無し）として開く
+- Windowsのメモ帳以外のエディタを使用
 
 ---
-### 11.2 詳細診断ガイド (ログ/再トランスクリプト監視)
 
-恒久修正フェーズで導入されたロギング & デバッグ支援機能の使い方です。
+## ログ機能
 
-#### (A) ロギング有効化
-`config.toml` に任意で `[logging]` セクションを追加:
+詳細なログを記録する場合は、`config.toml` に以下を追加：
+
 ```toml
 [logging]
-level = "DEBUG"          # INFO 以上を推奨。差分調査時のみ DEBUG
-file_enabled = true       # ファイル出力を有効化
-file_path = "app.log"     # 出力ファイルパス
-max_bytes = 1048576       # ローテーション閾値
-backup_count = 3          # 世代数
+level = "INFO"              # DEBUG / INFO / WARNING / ERROR / CRITICAL
+file_enabled = true         # ファイル出力を有効化
+file_path = "app.log"       # ログファイルのパス
+max_bytes = 1048576         # ローテーションサイズ（バイト）
+backup_count = 3            # 保持する世代数
 ```
 
-#### (B) セグメント再構築差分 (rebuild diff) 追跡
-`config.toml` に `[debug]` セクションを追加し `rebuild_diff = true` を設定すると、
-テーブル再描画時のセグメント配列差分が DEBUG ログに出力されます。
-```toml
-[debug]
-rebuild_diff = true
-```
-出力例:
-```
-12:34:56 [DEBUG] main: [DIFF][rebuild] +0 -0 modified=1
-12:34:56 [DEBUG] main: [DIFF][detail] row 12: end:14.32->14.56, text_lang1:旧->新
-```
-意味:
-- `+N` 追加行数 / `-N` 削除行数
-- `modified=M` 変更行 (最大 10 行まで詳細)
-- `row i:` start / end / text_lang1 / text_lang2 / lang の差分一覧
-
-#### (C) 分割/結合再文字起こし監視 (ウォッチドッグ)
-`[再解析中]` プレースホルダが既定 (15 秒) 超えて残る場合は内部ウォッチドッグがチェックします。
-
-#### (D) 運用戻し (ログ抑制)
-1. `[logging].level = "INFO"`
-2. `[debug]` セクション削除または `rebuild_diff = false`
-3. 既存ログはローテーション設定で整理
-
----
-## 11. パフォーマンス
-小規模モデル選択または GPU 利用で処理速度が大幅に向上します。
-
----
-## 12. ライセンス
-- faster-whisper (MIT) https://github.com/SYSTRAN/faster-whisper
-- 本ツール: ライセンス未記載（必要なら `LICENSE` 追加推奨: MIT など）
-
----
-## 13. 開発について
-
-このプロジェクトの内部アーキテクチャ、セグメントデータ構造、モジュール詳細については [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+デバッグ時のみ `level = "DEBUG"` に設定してください。
 
 ---
 
-ご要望・改善案があれば Issue / コメントなどでお知らせください。
+## 開発者向け情報
+
+内部アーキテクチャ、データ構造、モジュール構成については [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+
+---
+
+## ライセンス
+
+- faster-whisper: MIT License (https://github.com/SYSTRAN/faster-whisper)
+- 
+
+---
+
+## フィードバック
+
+ご要望や改善案がありましたら、Issueまたはコメントでお知らせください。

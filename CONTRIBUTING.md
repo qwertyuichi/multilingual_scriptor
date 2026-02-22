@@ -80,7 +80,7 @@ lang2_prob = logits.get(lang2, 0) / (logits[lang1] + logits.get(lang2, 0)) * 100
 | **UI (メイン)** | `ui/app.py` | GUI 本体。再生・編集・スレッド管理 |
 | **テーブル表示** | `ui/table_presenter.py` | テーブル更新・集約テキスト再構築 |
 | **編集ダイアログ** | `ui/edit_dialog.py` | セグメントのテキスト編集・分割ダイアログ |
-| **上級者向け設定ダイアログ** | `ui/hidden_params_dialog.py` | 詳細パラメータの編集 |
+| **高度な設定ダイアログ** | `ui/hidden_params_dialog.py` | 詳細パラメータの編集 |
 | **文字起こし (メイン)** | `transcription/processor.py` | Whisper + VAD + 言語判定 |
 | **マルチスレッド** | `transcription/threads.py` | `TranscriptionThread` / `RangeTranscriptionThread` |
 | **モデルキャッシュ** | `transcription/model_cache.py` | モデルの事前ロード・保持 |
