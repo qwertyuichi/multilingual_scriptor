@@ -61,3 +61,24 @@ def _load_cached_model(
     _MODEL_CACHE[key] = model
     logger.info(f"[MODEL_CACHE] loaded: {key}")
     return model
+
+
+def clear_cache() -> None:
+    """Unload and clear all cached models.
+
+    This removes references to WhisperModel instances from the LRU cache
+    so their destructors run in the main thread after any worker threads
+    have been stopped. Call this during application shutdown after
+    ensuring no transcription threads are active.
+    """
+    keys = list(_MODEL_CACHE.keys())
+    if not keys:
+        logger.debug("[MODEL_CACHE] clear: cache empty")
+        return
+    logger.info(f"[MODEL_CACHE] clearing {len(keys)} cached model(s)")
+    for k in keys:
+        try:
+            _MODEL_CACHE.pop(k, None)
+            logger.debug(f"[MODEL_CACHE] cleared: {k}")
+        except Exception as e:
+            logger.exception(f"[MODEL_CACHE] failed to clear {k}: {e}")

@@ -116,6 +116,9 @@ class VideoTranscriptionApp(QMainWindow):
         self._init_ui()
         self._connect_signals()
 
+        # Application is ready
+        self._initializing = False
+
         # テーブル操作シグナル
         self.transcription_table.cellClicked.connect(self._seek_to_table_row)
         self.transcription_table.cellDoubleClicked.connect(self._play_row_on_doubleclick)
@@ -139,20 +142,33 @@ class VideoTranscriptionApp(QMainWindow):
         with open(cfg_path, "rb") as f:
             data = _toml.load(f)
         try:
-            log_conf = data.get('logging') if isinstance(data, dict) else None
-            hidden_conf = data.get('hidden') if isinstance(data, dict) else None
-            if isinstance(hidden_conf, dict):
-                log_conf = dict(log_conf or {})
-                if 'log_file_enabled' in hidden_conf:
-                    log_conf['file_enabled'] = bool(hidden_conf.get('log_file_enabled'))
-                if 'log_level' in hidden_conf:
-                    log_conf['level'] = str(hidden_conf.get('log_level'))
-                if 'log_file_path' in hidden_conf:
-                    log_conf['file_path'] = str(hidden_conf.get('log_file_path'))
-                if 'log_max_bytes' in hidden_conf:
-                    log_conf['max_bytes'] = int(hidden_conf.get('log_max_bytes'))
-                if 'log_backup_count' in hidden_conf:
-                    log_conf['backup_count'] = int(hidden_conf.get('log_backup_count'))
+            # Priority for logging config:
+            # 1) data['advanced']['logging'] (new desired place)
+            # 2) data['logging'] (legacy top-level)
+            # 3) flattened logging keys inside data['advanced'] or data['hidden'] (back-compat)
+            log_conf = None
+            if isinstance(data, dict):
+                # prefer advanced section
+                adv = data.get('advanced') or data.get('hidden')
+                if isinstance(adv, dict) and isinstance(adv.get('logging'), dict):
+                    log_conf = dict(adv.get('logging'))
+                elif isinstance(data.get('logging'), dict):
+                    log_conf = dict(data.get('logging'))
+                elif isinstance(adv, dict):
+                    # look for flattened logging keys inside advanced/hidden
+                    log_conf = {}
+                    if 'log_file_enabled' in adv:
+                        log_conf['file_enabled'] = bool(adv.get('log_file_enabled'))
+                    if 'log_level' in adv:
+                        log_conf['level'] = str(adv.get('log_level'))
+                    if 'log_file_path' in adv:
+                        log_conf['file_path'] = str(adv.get('log_file_path'))
+                    if 'log_max_bytes' in adv:
+                        log_conf['max_bytes'] = int(adv.get('log_max_bytes'))
+                    if 'log_backup_count' in adv:
+                        log_conf['backup_count'] = int(adv.get('log_backup_count'))
+                    if not log_conf:
+                        log_conf = None
             setup_logging(log_conf)
             logger.info("Logging initialized level=%s", (log_conf or {}).get('level', 'INFO'))
         except Exception:
@@ -322,26 +338,18 @@ class VideoTranscriptionApp(QMainWindow):
         time_layout.addWidget(self.total_time_label)
         control_layout.addLayout(time_layout)
 
-        button_layout = QHBoxLayout()
-        self.open_button = QPushButton("動画を開く")
-        self.open_button.clicked.connect(self.open_file)
-        button_layout.addWidget(self.open_button)
-
-        self.play_button = QPushButton()
-        self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.play_button.clicked.connect(self.play_pause)
-        self.play_button.setEnabled(False)
-        button_layout.addWidget(self.play_button)
-
-        self.stop_button = QPushButton()
-        self.stop_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_button.clicked.connect(self.stop_video)
-        self.stop_button.setEnabled(False)
-        button_layout.addWidget(self.stop_button)
-        button_layout.addStretch()
-        control_layout.addLayout(button_layout)
-
+        # Unified toolbar: open / play / stop / seek buttons / export buttons
+        TOOL_BTN_HEIGHT = 32
         SEEK_BTN_WIDTH = 52
+
+        def make_tool_btn(label: str | None, icon: QStyle.StandardPixmap | None, tooltip: str, enabled: bool = True) -> QPushButton:
+            btn = QPushButton(label if label else "")
+            if icon is not None:
+                btn.setIcon(self.style().standardIcon(icon))
+            btn.setToolTip(tooltip)
+            btn.setEnabled(enabled)
+            btn.setFixedHeight(TOOL_BTN_HEIGHT)
+            return btn
 
         def make_seek_btn(label: str, delta_ms: int, tooltip: str) -> QPushButton:
             btn = QPushButton(label)
@@ -349,18 +357,51 @@ class VideoTranscriptionApp(QMainWindow):
             btn.setToolTip(tooltip)
             btn.clicked.connect(lambda _=None, d=delta_ms: self.seek_relative(d))
             btn.setFixedWidth(SEEK_BTN_WIDTH)
+            btn.setFixedHeight(TOOL_BTN_HEIGHT)
             return btn
 
+        toolbar = QHBoxLayout()
+        # Open button
+        self.open_button = make_tool_btn("動画を開く", None, "ファイルを開きます")
+        self.open_button.clicked.connect(self.open_file)
+        toolbar.addWidget(self.open_button)
+
+        # Play / Stop
+        self.play_button = make_tool_btn(None, QStyle.SP_MediaPlay, "再生 / 一時停止", False)
+        self.play_button.clicked.connect(self.play_pause)
+        toolbar.addWidget(self.play_button)
+
+        self.stop_button = make_tool_btn(None, QStyle.SP_MediaStop, "停止", False)
+        self.stop_button.clicked.connect(self.stop_video)
+        toolbar.addWidget(self.stop_button)
+
+        # Seek buttons
         self.seek_back_10_btn = make_seek_btn("◀10s", -10000, "10秒戻る")
         self.seek_back_1_btn  = make_seek_btn("◀1s",  -1000,  "1秒戻る")
         self.seek_fwd_1_btn   = make_seek_btn("1s▶",   1000,  "1秒進む")
         self.seek_fwd_10_btn  = make_seek_btn("10s▶", 10000,  "10秒進む")
-        seek_layout = QHBoxLayout()
-        for btn in (self.seek_back_10_btn, self.seek_back_1_btn,
-                self.seek_fwd_1_btn, self.seek_fwd_10_btn):
-            seek_layout.addWidget(btn)
-        seek_layout.addStretch()
-        control_layout.addLayout(seek_layout)
+        for btn in (self.seek_back_10_btn, self.seek_back_1_btn, self.seek_fwd_1_btn, self.seek_fwd_10_btn):
+            toolbar.addWidget(btn)
+
+        toolbar.addStretch()
+
+        # Partial / Full export buttons (moved into toolbar so all target buttons align)
+        self.partial_export_button = QPushButton("部分書き出し")
+        self.partial_export_button.setEnabled(False)
+        self.partial_export_button.setToolTip(
+            "選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し"
+        )
+        self.partial_export_button.clicked.connect(self.partial_export_selected)
+        self.partial_export_button.setFixedHeight(TOOL_BTN_HEIGHT)
+        toolbar.addWidget(self.partial_export_button)
+
+        self.export_button = QPushButton("全文書き出し...")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_transcription)
+        self.export_button.setFixedHeight(TOOL_BTN_HEIGHT)
+        toolbar.addWidget(self.export_button)
+
+        control_layout.addLayout(toolbar)
         video_vlayout.addLayout(control_layout)
 
         # ---- テーブルコンテナ ----
@@ -369,20 +410,10 @@ class VideoTranscriptionApp(QMainWindow):
         table_vlayout.setContentsMargins(0, 0, 0, 0)
         table_vlayout.setSpacing(4)
 
+        # Keep an empty spacer area where export buttons used to be (buttons moved to toolbar)
         top_export_bar = QHBoxLayout()
         top_export_bar.setContentsMargins(0, 0, 0, 0)
         top_export_bar.addStretch()
-        self.partial_export_button = QPushButton("部分書き出し")
-        self.partial_export_button.setEnabled(False)
-        self.partial_export_button.setToolTip(
-            "選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し"
-        )
-        self.partial_export_button.clicked.connect(self.partial_export_selected)
-        top_export_bar.addWidget(self.partial_export_button)
-        self.export_button = QPushButton("全文書き出し...")
-        self.export_button.setEnabled(False)
-        self.export_button.clicked.connect(self.export_transcription)
-        top_export_bar.addWidget(self.export_button)
         table_vlayout.addLayout(top_export_bar)
 
         self.transcription_table = QTableWidget()
@@ -533,8 +564,9 @@ class VideoTranscriptionApp(QMainWindow):
         lang_layout = QVBoxLayout()
 
         # プルダウン選択肢 ("code - 日本語名" 形式)
-        hidden_cfg = self.config.get("hidden", {}) if isinstance(self.config, dict) else {}
-        allowed_langs = hidden_cfg.get("available_languages")
+        # advanced section (preferred) - fall back to legacy 'hidden' for compat
+        advanced_cfg = self.config.get("advanced", self.config.get("hidden", {})) if isinstance(self.config, dict) else {}
+        allowed_langs = advanced_cfg.get("available_languages")
         if not isinstance(allowed_langs, list) or not allowed_langs:
             allowed_langs = [
                 "en", "es", "it", "ja", "de", "zh",
@@ -1978,8 +2010,9 @@ class VideoTranscriptionApp(QMainWindow):
     # ================================================================
 
     def _open_hidden_params_dialog(self) -> None:
-        """上級者向け設定ダイアログを開き、設定を config.toml の [hidden] に保存する。"""
-        current_hidden = self.config.get("hidden", {})
+        """上級者向け設定ダイアログを開き、設定を config.toml の [advanced] に保存する。"""
+        # provide advanced (preferred) or fall back to legacy hidden section
+        current_hidden = self.config.get("advanced", self.config.get("hidden", {}))
         
         dialog = HiddenParamsDialog(current_hidden, self)
         if dialog.exec() == HiddenParamsDialog.Accepted:
@@ -1996,13 +2029,29 @@ class VideoTranscriptionApp(QMainWindow):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     doc = tomlkit.load(f)
                 
-                # [hidden] セクションが無ければ作成
-                if "hidden" not in doc:
-                    doc["hidden"] = tomlkit.table()
-                
+                # ensure [advanced] exists (preferred)
+                if "advanced" not in doc:
+                    doc["advanced"] = tomlkit.table()
+
+                # ensure nested [advanced.logging] exists for logging-related keys
+                if "logging" not in doc["advanced"] or not isinstance(doc["advanced"].get("logging"), dict):
+                    doc["advanced"]["logging"] = tomlkit.table()
+
+                # Map logging-related flat keys into the nested logging table
+                LOG_KEY_MAP = {
+                    "log_file_enabled": "file_enabled",
+                    "log_level": "level",
+                    "log_file_path": "file_path",
+                    "log_max_bytes": "max_bytes",
+                    "log_backup_count": "backup_count",
+                }
+
                 # 各パラメータを更新
                 for key, val in new_values.items():
-                    doc["hidden"][key] = val
+                    if key in LOG_KEY_MAP:
+                        doc["advanced"]["logging"][LOG_KEY_MAP[key]] = val
+                    else:
+                        doc["advanced"][key] = val
                 
                 # ファイルに書き戻し (書式・コメント保持)
                 with open(cfg_path, "w", encoding="utf-8") as f:
@@ -2015,9 +2064,9 @@ class VideoTranscriptionApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "保存完了",
-                    "上級者向け設定を config.toml に保存しました。\n次回の文字起こしから反映されます。"
+                    "上級者向け設定を config.toml の [advanced] セクションに保存しました。\n次回の文字起こしから反映されます。"
                 )
-                logger.info(f"[HIDDEN] Updated hidden params: {new_values}")
+                logger.info(f"[ADVANCED] Updated advanced params: {new_values}")
                 
             except Exception as e:
                 logger.exception("Failed to save hidden params")
@@ -2328,6 +2377,59 @@ class VideoTranscriptionApp(QMainWindow):
                     self.sync_table_selection_with_position(pos)
         except Exception:
             pass
+
+    def closeEvent(self, event) -> None:
+        """Ensure background transcription threads are stopped and models
+        are unloaded before the application exits. Shows a small waiting
+        dialog while shutdown proceeds.
+        """
+        # Collect running transcription threads
+        threads = []
+        if getattr(self, 'transcription_thread', None) and self.transcription_thread.isRunning():
+            threads.append(self.transcription_thread)
+        if getattr(self, 'range_thread', None) and self.range_thread.isRunning():
+            threads.append(self.range_thread)
+
+        if threads:
+            from PySide6.QtWidgets import QMessageBox
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle('終了処理中')
+            dlg.setText('処理を終了しています。しばらくお待ちください...')
+            dlg.setStandardButtons(QMessageBox.NoButton)
+            dlg.setModal(True)
+            dlg.show()
+
+            # Request cancel on threads
+            for t in threads:
+                try:
+                    if hasattr(t, 'request_cancel'):
+                        t.request_cancel()
+                except Exception:
+                    pass
+
+            # Wait up to 20s for threads to finish, checking periodically
+            total_wait = 0
+            timeout_ms = 20000
+            interval = 250
+            while any(t.isRunning() for t in threads) and total_wait < timeout_ms:
+                for t in threads:
+                    try:
+                        t.wait(interval)
+                    except Exception:
+                        pass
+                QApplication.processEvents()
+                total_wait += interval
+
+            dlg.close()
+
+        # Clear model cache now that threads are stopped
+        try:
+            import transcription.model_cache as model_cache
+            model_cache.clear_cache()
+        except Exception:
+            logger.exception('Failed to clear model cache during shutdown')
+
+        super().closeEvent(event)
 
     def _on_device_changed(self, *_args) -> None:
         """デバイス変更時の処理"""

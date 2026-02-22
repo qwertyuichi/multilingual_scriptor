@@ -35,17 +35,7 @@ vad_threshold = 0.5
 vad_min_speech_ms = 250
 vad_min_silence_ms = 500           # 発話テンポが速い配信に合わせて短め
 
-
-[logging]
-# デバッグ用にファイルログを有効化
-level = "INFO"
-file_enabled = true
-file_path = "app.log"
-max_bytes = 1048576
-backup_count = 2
-
-
-[hidden]
+[advanced]
 # ================================================================
 # GUI には表示されない上級者向けパラメータ。
 # config.toml を直接編集することで調整可能。全プロファイル共通。
@@ -159,17 +149,20 @@ available_languages = [
 
 # ---- 確率デバッグ ----
 # クリップごとの確率ログを出力 (INFO)
-debug_prob_log = true
+debug_prob_log = false
+
+# ---- ログ設定 (advanced.logging に移動) ----
+[advanced.logging]
 # ファイルログ(app.log)出力
-log_file_enabled = true
+file_enabled = false
 # ログレベル
-log_level = "DEBUG"
+level = "INFO"
 # ログ出力パス
-log_file_path = "app.log"
+file_path = "app.log"
 # ログ最大サイズ (bytes)
-log_max_bytes = 1048576
+max_bytes = 1048576
 # ログ世代数
-log_backup_count = 2
+backup_count = 5
 
 # ---- Beam Size 詳細設定 ----
 phase1_beam_size = 5

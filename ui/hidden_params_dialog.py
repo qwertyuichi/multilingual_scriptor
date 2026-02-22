@@ -1,6 +1,6 @@
 """上級者向け設定ダイアログ。
 
-config.toml の [hidden] セクションを GUI から編集可能にします。
+config.toml の [advanced] セクションを GUI から編集可能にします。
 """
 from __future__ import annotations
 
@@ -33,7 +33,8 @@ class HiddenParamsDialog(QDialog):
     def __init__(self, current_hidden: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("上級者向け設定")
-        self.setMinimumSize(980, 620)
+        # Reduce minimum height so dialog can shrink to fit content
+        self.setMinimumSize(980, 594)
         
         self.current_hidden = current_hidden.copy()
         self.widgets = {}
@@ -69,7 +70,7 @@ class HiddenParamsDialog(QDialog):
 
         # 説明ラベル
         info = QLabel(
-            "上級者向けパラメータです。変更後は「適用」を押すと config.toml の [hidden] セクションに保存されます。"
+            "上級者向けパラメータです。変更後は「適用」を押すと config.toml の [advanced] セクションに保存されます。"
         )
         info.setWordWrap(True)
         info.setStyleSheet("QLabel { color: #888; margin-bottom: 10px; }")
@@ -78,8 +79,12 @@ class HiddenParamsDialog(QDialog):
         # スクロールエリア
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # Allow the scroll area to expand/shrink to avoid leaving empty space below
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
+        # Ensure inner widget expands with the scroll area
+        scroll_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         columns_container = QWidget()
         columns_layout = QHBoxLayout(columns_container)
         columns_layout.setContentsMargins(0, 0, 0, 0)
@@ -89,6 +94,9 @@ class HiddenParamsDialog(QDialog):
         columns_layout.addLayout(right_col, 1)
         
         # ---- 言語判定設定 (Beam Size + あいまい判定を統合) ----
+        # Shared height for language-related groups so they align exactly
+        # Restoring to original value per request.
+        SHARED_LANG_HEIGHT = 260
         lang_detect_group = QGroupBox("言語判定設定")
         lang_detect_layout = QFormLayout()
 
@@ -129,6 +137,8 @@ class HiddenParamsDialog(QDialog):
         )
 
         lang_detect_group.setLayout(lang_detect_layout)
+        # Make height identical to the language candidates group
+        lang_detect_group.setFixedHeight(SHARED_LANG_HEIGHT)
         left_col.addWidget(lang_detect_group)
         
         # ---- 言語候補 ----
@@ -137,7 +147,9 @@ class HiddenParamsDialog(QDialog):
 
         lang_scroll = QScrollArea()
         lang_scroll.setWidgetResizable(True)
-        lang_scroll.setMinimumHeight(220)
+        # Make language candidate area height follow the shared height (with padding)
+        # Give slightly more bottom padding to avoid touching the groupbox border.
+        lang_scroll.setFixedHeight(SHARED_LANG_HEIGHT - 30)
         lang_widget = QWidget()
         lang_grid = QGridLayout(lang_widget)
         lang_grid.setContentsMargins(4, 4, 4, 4)
@@ -164,6 +176,9 @@ class HiddenParamsDialog(QDialog):
         lang_scroll.setWidget(lang_widget)
         lang_outer.addWidget(lang_scroll)
         lang_group.setLayout(lang_outer)
+        # Set the same fixed height so the two columns align perfectly
+        lang_group.setFixedHeight(SHARED_LANG_HEIGHT)
+        lang_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         right_col.addWidget(lang_group)
         
         # ---- その他のパラメータグループ ----
@@ -320,6 +335,8 @@ class HiddenParamsDialog(QDialog):
         )
 
         log_group.setLayout(log_layout)
+        # Mirror size policy so left and right columns keep similar height
+        log_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_col.addWidget(log_group)
 
         # ---- ログ関連フラグをログ設定に統合 ----
@@ -349,7 +366,8 @@ class HiddenParamsDialog(QDialog):
         right_col.addStretch()
         scroll_layout.addWidget(columns_container)
         scroll.setWidget(scroll_widget)
-        main_layout.addWidget(scroll)
+        # Give the scroll area stretch so it fills available vertical space
+        main_layout.addWidget(scroll, 1)
         
         # ---- ボタン行 ----
         btn_layout = QHBoxLayout()
