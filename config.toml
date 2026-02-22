@@ -1,12 +1,12 @@
 [default]
 # ===== 基本設定 =====
-device = "cuda"                    # cpu / cuda / auto
+device = "cuda"                    # cpu / cuda
 model = "large-v3"                 # large-v3 / distil-large-v3
-default_languages = ["ja"]         # 起動時に選択する言語
+default_languages = ["ja", "en"]   # 起動時に選択する言語
 
 # ===== 言語ウェイト =====
-ja_weight = 0.50                   # 日本語スコアの補正係数 (ja_weight + ru_weight = 1.0)
-ru_weight = 0.50                   # ロシア語スコアの補正係数 (ja_weight + ru_weight = 1.0)
+lang1_weight = 0.50                # 言語1スコアの補正係数 (lang1_weight + lang2_weight = 1.0)
+lang2_weight = 0.50                # 言語2スコアの補正係数 (lang1_weight + lang2_weight = 1.0)
 
 # ===== 文字起こし調整 =====
 no_speech_threshold = 0.6          # 無音スキップ感度: 0に近いほど無音と判定しにくい (0〜1)
@@ -24,8 +24,8 @@ device = "cuda"
 model = "large-v3"
 default_languages = ["ja", "ru"]
 
-ja_weight = 0.4
-ru_weight = 0.6
+lang1_weight = 0.4
+lang2_weight = 0.6
 
 no_speech_threshold = 0.6
 initial_prompt = "風見カプラ Всем Привет Казами Капра"
@@ -35,12 +35,145 @@ vad_threshold = 0.5
 vad_min_speech_ms = 250
 vad_min_silence_ms = 500           # 発話テンポが速い配信に合わせて短め
 
-
-[hidden]
+[advanced]
 # ================================================================
-# GUI には表示されない上級者向けパラメータ。
+# GUI には表示されない高度なパラメータ。
 # config.toml を直接編集することで調整可能。全プロファイル共通。
 # ================================================================
+
+# ---- 言語候補 (プルダウン) ----
+# ここに記載された言語のみがプルダウンに表示されます。
+# 追加したい言語は行頭の # を外してください。
+available_languages = [
+	"en", # 英語
+	"es", # スペイン語
+	"it", # イタリア語
+	"ja", # 日本語
+	"de", # ドイツ語
+	"zh", # 中国語
+	"ru", # ロシア語
+	"ko", # 韓国語
+	"pt", # ポルトガル語
+	"fr", # フランス語
+	# "pl", # ポーランド語
+	# "nl", # オランダ語
+	# "af", # アフリカーンス語
+	# "am", # アムハラ語
+	# "ar", # アラビア語
+	# "as", # アッサム語
+	# "az", # アゼルバイジャン語
+	# "ba", # バシキール語
+	# "be", # ベラルーシ語
+	# "bg", # ブルガリア語
+	# "bn", # ベンガル語
+	# "bo", # チベット語
+	# "br", # ブルトン語
+	# "bs", # ボスニア語
+	# "ca", # カタルーニャ語
+	# "cs", # チェコ語
+	# "cy", # ウェールズ語
+	# "da", # デンマーク語
+	# "el", # ギリシャ語
+	# "et", # エストニア語
+	# "eu", # バスク語
+	# "fa", # ペルシャ語
+	# "fi", # フィンランド語
+	# "fo", # フェロー語
+	# "gl", # ガリシア語
+	# "gu", # グジャラート語
+	# "ha", # ハウサ語
+	# "haw", # ハワイ語
+	# "he", # ヘブライ語
+	# "hi", # ヒンディー語
+	# "hr", # クロアチア語
+	# "ht", # ハイチ・クレオール語
+	# "hu", # ハンガリー語
+	# "hy", # アルメニア語
+	# "id", # インドネシア語
+	# "is", # アイスランド語
+	# "jw", # ジャワ語
+	# "ka", # ジョージア語
+	# "kk", # カザフ語
+	# "km", # クメール語
+	# "kn", # カンナダ語
+	# "la", # ラテン語
+	# "lb", # ルクセンブルク語
+	# "ln", # リンガラ語
+	# "lo", # ラオ語
+	# "lt", # リトアニア語
+	# "lv", # ラトビア語
+	# "mg", # マダガスカル語
+	# "mi", # マオリ語
+	# "mk", # マケドニア語
+	# "ml", # マラヤーラム語
+	# "mn", # モンゴル語
+	# "mr", # マラーティー語
+	# "ms", # マレー語
+	# "mt", # マルタ語
+	# "my", # ミャンマー語
+	# "ne", # ネパール語
+	# "nn", # ニーノシュク語
+	# "no", # ノルウェー語
+	# "oc", # オック語
+	# "pa", # パンジャブ語
+	# "ps", # パシュトー語
+	# "ro", # ルーマニア語
+	# "sa", # サンスクリット語
+	# "sd", # シンド語
+	# "si", # シンハラ語
+	# "sk", # スロバキア語
+	# "sl", # スロベニア語
+	# "sn", # ショナ語
+	# "so", # ソマリ語
+	# "sq", # アルバニア語
+	# "sr", # セルビア語
+	# "su", # スンダ語
+	# "sv", # スウェーデン語
+	# "sw", # スワヒリ語
+	# "ta", # タミル語
+	# "te", # テルグ語
+	# "tg", # タジク語
+	# "th", # タイ語
+	# "tk", # トルクメン語
+	# "tl", # タガログ語
+	# "tr", # トルコ語
+	# "tt", # タタール語
+	# "uk", # ウクライナ語
+	# "ur", # ウルドゥー語
+	# "uz", # ウズベク語
+	# "vi", # ベトナム語
+	# "yi", # イディッシュ語
+	# "yo", # ヨルバ語
+	# "yue", # 広東語
+]
+
+# ---- 確率デバッグ ----
+# クリップごとの確率ログを出力 (INFO)
+debug_prob_log = false
+
+# ---- ログ設定 (advanced.logging に移動) ----
+phase1_beam_size = 5
+phase2_detect_beam_size = 1
+phase2_retranscribe_beam_size = 5
+ambiguous_threshold = 70.0
+condition_on_previous_text = true
+compression_ratio_threshold = 2.4
+log_prob_threshold = -1.0
+repetition_penalty = 1.0
+speech_pad_ms = 400
+duplicate_merge = true
+
+[advanced.logging]
+# ファイルログ(app.log)出力
+file_enabled = false
+# ログレベル
+level = "INFO"
+# ログ出力パス
+file_path = "app.log"
+# ログ最大サイズ (bytes)
+max_bytes = 1048576
+# ログ世代数
+backup_count = 5
 
 # ---- Beam Size 詳細設定 ----
 phase1_beam_size = 5
@@ -48,7 +181,7 @@ phase2_detect_beam_size = 1
 phase2_retranscribe_beam_size = 5
 
 # ---- 言語判定 ----
-ambiguous_threshold = 50.0
+ambiguous_threshold = 70.0
 
 # ---- その他 ----
 condition_on_previous_text = true

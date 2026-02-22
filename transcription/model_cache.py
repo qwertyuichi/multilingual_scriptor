@@ -6,6 +6,8 @@ LRU で保持して再利用する。
 from __future__ import annotations
 
 from collections import OrderedDict
+import gc
+import time
 
 from faster_whisper import WhisperModel
 
@@ -61,3 +63,40 @@ def _load_cached_model(
     _MODEL_CACHE[key] = model
     logger.info(f"[MODEL_CACHE] loaded: {key}")
     return model
+
+
+def clear_cache() -> None:
+    """Unload and clear all cached models.
+
+    This removes references to WhisperModel instances from the LRU cache
+    so their destructors run in the main thread after any worker threads
+    have been stopped. Call this during application shutdown after
+    ensuring no transcription threads are active.
+    """
+    keys = list(_MODEL_CACHE.keys())
+    if not keys:
+        logger.debug("[MODEL_CACHE] clear: cache empty")
+        return
+    logger.info(f"[MODEL_CACHE] clearing {len(keys)} cached model(s)")
+
+    # Pop and explicitly delete model instances, then force GC to ensure
+    # underlying C++ destructors run on the main thread. Add a small sleep
+    # between deletions to give native libraries time to release device
+    # resources (helps avoid races in ctranslate2 / device allocators).
+    for k in keys:
+        try:
+            model = _MODEL_CACHE.pop(k, None)
+            if model is not None:
+                try:
+                    del model
+                except Exception:
+                    pass
+            logger.debug(f"[MODEL_CACHE] cleared: {k}")
+            # let destructor run
+            gc.collect()
+            time.sleep(0.05)
+        except Exception as e:
+            logger.exception(f"[MODEL_CACHE] failed to clear {k}: {e}")
+
+    # Final GC pass
+    gc.collect()

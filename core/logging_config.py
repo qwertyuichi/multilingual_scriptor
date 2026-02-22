@@ -49,6 +49,29 @@ DATEFMT = "%H:%M:%S"
 def setup_logging(config: Dict[str, Any] | None = None) -> None:
     global _LOG_INITIALIZED
     if _LOG_INITIALIZED:
+        # 既に初期化済みでも、ファイル出力が有効ならハンドラ追加を試みる
+        cfg = dict(DEFAULT_LOG_CONF)
+        if config:
+            cfg.update({k: v for k, v in config.items() if k in cfg})
+        if cfg.get("file_enabled"):
+            filename = cfg.get("file_path", "app.log")
+            root = logging.getLogger()
+            has_file = any(
+                isinstance(h, RotatingFileHandler) and h.baseFilename.endswith(filename)
+                for h in root.handlers
+            )
+            if not has_file:
+                try:
+                    handler = RotatingFileHandler(
+                        filename=filename,
+                        maxBytes=int(cfg.get("max_bytes", 1_000_000)),
+                        backupCount=int(cfg.get("backup_count", 2)),
+                        encoding="utf-8",
+                    )
+                    handler.setFormatter(logging.Formatter(FORMAT, DATEFMT))
+                    root.addHandler(handler)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"ファイルロギング初期化失敗: {e}")
         return
     cfg = dict(DEFAULT_LOG_CONF)
     if config:

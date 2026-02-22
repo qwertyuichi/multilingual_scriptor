@@ -25,21 +25,31 @@ def dynamic_time_split(segments: List[dict], row_index: int, current_time_sec: f
     if not (start < current_time_sec < end):
         return None, None
     # どのテキストを基準に長さ計測するか: chosen_language 優先、なければ確率優勢言語
-    text_ja = seg.get('text_ja', '')
-    text_ru = seg.get('text_ru', '')
-    ja_prob = seg.get('ja_prob', 0.0); ru_prob = seg.get('ru_prob', 0.0)
+    text_lang1 = seg.get('text_lang1', '')
+    text_lang2 = seg.get('text_lang2', '')
+    lang1_prob = seg.get('lang1_prob', 0.0); lang2_prob = seg.get('lang2_prob', 0.0)
+    lang1_code = seg.get('lang1_code', 'ja')
+    lang2_code = seg.get('lang2_code', 'ru')
     chosen = seg.get('chosen_language')
-    if chosen == 'ja' and text_ja:
-        base_text = text_ja; which = 'ja'
-    elif chosen == 'ru' and text_ru:
-        base_text = text_ru; which = 'ru'
+    if chosen == lang1_code and text_lang1:
+        base_text = text_lang1; which = 'lang1'
+    elif chosen == lang2_code and text_lang2:
+        base_text = text_lang2; which = 'lang2'
     else:
-        if ja_prob >= ru_prob:
-            base_text = text_ja; which = 'ja'
+        if lang1_prob >= lang2_prob:
+            base_text = text_lang1; which = 'lang1'
         else:
-            base_text = text_ru; which = 'ru'
+            base_text = text_lang2; which = 'lang2'
+    # Fallback: if specific language fields are empty but a generic 'text' exists,
+    # use it as the basis for position calculation. This covers cases where a
+    # forced re-recognition updated 'text' but not 'text_lang1'/'text_lang2'.
     if not base_text:
-        return None, None
+        fallback_text = seg.get('text', '')
+        if fallback_text:
+            base_text = fallback_text
+            which = 'text'
+        else:
+            return None, None
     # 文字位置計算
     ratio = (current_time_sec - start) / max(1e-9, (end - start))
     pos = int(len(base_text) * ratio)
@@ -80,12 +90,16 @@ def merge_contiguous_segments(segments: List[dict], indices: List[int]) -> Tuple
         return None, None, None
     # Build merged placeholder segment (id: keep first's id)
     first = selected[0]
+    # Concatenate text from selected segments
+    merged_text = ' '.join([s.get('text', '').strip() for s in selected if s.get('text')])
     placeholder = Segment(
         start=start, end=end,
-        text='', text_ja='', text_ru='',
-        chosen_language=first.get('chosen_language'),
+        text=merged_text, text_lang1='', text_lang2='',
+        chosen_language=None,
         id=first.get('id', idx_sorted[0]),
-        ja_prob=0.0, ru_prob=0.0
+        lang1_prob=0.0, lang2_prob=0.0,
+        lang1_code=first.get('lang1_code', 'ja'),
+        lang2_code=first.get('lang2_code', 'ru'),
     )
     out: List[Segment] = []
     for i, s in enumerate(segs):

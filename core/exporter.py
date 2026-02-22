@@ -44,7 +44,8 @@ def build_export_text(result: dict, fmt: str) -> str:
     """指定フォーマット(`txt` / `srt`)の書き出し文字列を生成。
 
     Notes:
-        - `txt` 形式: 各行に [開始 -> 終了] + 言語ごとの確率 + JA/RU テキスト。
+        - `txt` 形式: 各行に [開始 -> 終了] + 言語ごとの確率 + LANG1/LANG2 テキスト。
+          LANG2 テキストが空の場合は出力しない (BUG-12 修正)。
         - `srt` 形式: SRT 互換。優勢(確率の高い)言語テキストを採用。
         - JSON 出力は `build_json_payload` を利用し呼び出し側で `json.dump` してください。
     """
@@ -58,15 +59,27 @@ def build_export_text(result: dict, fmt: str) -> str:
             if seg.get('gap'):
                 continue  # GAP は出力しない
             st = float(seg.get('start', 0.0)); ed = float(seg.get('end', 0.0))
-            ja_prob = seg.get('ja_prob', 0.0); ru_prob = seg.get('ru_prob', 0.0)
-            ja_text = seg.get('text_ja', '') or ''
-            ru_text = seg.get('text_ru', '') or ''
-            if not (ja_text or ru_text):
+            lang1_prob = seg.get('lang1_prob', 0.0); lang2_prob = seg.get('lang2_prob', 0.0)
+            lang1_code = (seg.get('lang1_code') or 'lang1').upper()
+            lang2_code = (seg.get('lang2_code') or '').upper()
+            t1 = seg.get('text_lang1', '') or ''
+            t2 = seg.get('text_lang2', '') or ''
+            if not (t1 or t2):
                 continue
-            lines.append(
-                f"[{fmt_ts(st)} -> {fmt_ts(ed)}] [JA:{ja_prob:05.2f}%] [RU:{ru_prob:05.2f}%] "
-                f"JA={ja_text} | RU={ru_text}"
-            )
+            # BUG-12 修正: lang2 テキストが空なら lang2 部分を省略
+            if t2 and lang2_code:
+                line = (
+                    f"[{fmt_ts(st)} -> {fmt_ts(ed)}] "
+                    f"[{lang1_code}:{lang1_prob:05.2f}%] [{lang2_code}:{lang2_prob:05.2f}%] "
+                    f"{lang1_code}={t1} | {lang2_code}={t2}"
+                )
+            else:
+                line = (
+                    f"[{fmt_ts(st)} -> {fmt_ts(ed)}] "
+                    f"[{lang1_code}:{lang1_prob:05.2f}%] "
+                    f"{lang1_code}={t1}"
+                )
+            lines.append(line)
         return '\n'.join(lines)
     if fmt == 'srt':
         blocks: List[str] = []
@@ -75,16 +88,18 @@ def build_export_text(result: dict, fmt: str) -> str:
             if seg.get('gap'):
                 continue  # GAP は出力しない
             st = float(seg.get('start', 0.0)); ed = float(seg.get('end', 0.0))
-            ja_prob = seg.get('ja_prob', 0.0); ru_prob = seg.get('ru_prob', 0.0)
-            text_ja = seg.get('text_ja', '') or ''
-            text_ru = seg.get('text_ru', '') or ''
+            lang1_prob = seg.get('lang1_prob', 0.0); lang2_prob = seg.get('lang2_prob', 0.0)
+            lang1_code = seg.get('lang1_code', 'ja')
+            lang2_code = seg.get('lang2_code')
+            t1 = seg.get('text_lang1', '') or ''
+            t2 = seg.get('text_lang2', '') or ''
             chosen = seg.get('chosen_language')
-            if chosen == 'ja' and text_ja:
-                txt = text_ja
-            elif chosen == 'ru' and text_ru:
-                txt = text_ru
+            if chosen == lang1_code and t1:
+                txt = t1
+            elif lang2_code and chosen == lang2_code and t2:
+                txt = t2
             else:
-                txt = text_ja if ja_prob >= ru_prob else text_ru
+                txt = t1 if lang1_prob >= lang2_prob else (t2 or t1)
             if not txt:
                 continue
             blocks.append(

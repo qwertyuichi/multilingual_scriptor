@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+import gc
 import tomllib as _toml
 
 try:
@@ -62,6 +63,8 @@ from PySide6.QtWidgets import (
 
 from core.constants import (
     WHISPER_MODELS,
+    WHISPER_LANGUAGES,
+    WHISPER_LANGUAGES_JA,
     PLACEHOLDER_PENDING,
     DEFAULT_WATCHDOG_TIMEOUT_MS,
     MAX_RANGE_SEC,
@@ -114,6 +117,9 @@ class VideoTranscriptionApp(QMainWindow):
         self._init_ui()
         self._connect_signals()
 
+        # Application is ready
+        self._initializing = False
+
         # テーブル操作シグナル
         self.transcription_table.cellClicked.connect(self._seek_to_table_row)
         self.transcription_table.cellDoubleClicked.connect(self._play_row_on_doubleclick)
@@ -137,7 +143,33 @@ class VideoTranscriptionApp(QMainWindow):
         with open(cfg_path, "rb") as f:
             data = _toml.load(f)
         try:
-            log_conf = data.get('logging') if isinstance(data, dict) else None
+            # Priority for logging config:
+            # 1) data['advanced']['logging'] (new desired place)
+            # 2) data['logging'] (legacy top-level)
+            # 3) flattened logging keys inside data['advanced'] or data['hidden'] (back-compat)
+            log_conf = None
+            if isinstance(data, dict):
+                # prefer advanced section
+                adv = data.get('advanced') or data.get('hidden')
+                if isinstance(adv, dict) and isinstance(adv.get('logging'), dict):
+                    log_conf = dict(adv.get('logging'))
+                elif isinstance(data.get('logging'), dict):
+                    log_conf = dict(data.get('logging'))
+                elif isinstance(adv, dict):
+                    # look for flattened logging keys inside advanced/hidden
+                    log_conf = {}
+                    if 'log_file_enabled' in adv:
+                        log_conf['file_enabled'] = bool(adv.get('log_file_enabled'))
+                    if 'log_level' in adv:
+                        log_conf['level'] = str(adv.get('log_level'))
+                    if 'log_file_path' in adv:
+                        log_conf['file_path'] = str(adv.get('log_file_path'))
+                    if 'log_max_bytes' in adv:
+                        log_conf['max_bytes'] = int(adv.get('log_max_bytes'))
+                    if 'log_backup_count' in adv:
+                        log_conf['backup_count'] = int(adv.get('log_backup_count'))
+                    if not log_conf:
+                        log_conf = None
             setup_logging(log_conf)
             logger.info("Logging initialized level=%s", (log_conf or {}).get('level', 'INFO'))
         except Exception:
@@ -157,8 +189,8 @@ class VideoTranscriptionApp(QMainWindow):
         # ---- 表示名/ヘルプテキスト (ツールチップ用) ----
         DISPLAY_LABELS = {
             "default_languages": "初期選択言語",
-            "ja_weight": "日本語の重み",
-            "ru_weight": "ロシア語の重み",
+            "lang1_weight": "言語1の重み",
+            "lang2_weight": "言語2の重み",
             "no_speech_threshold": "無音判定しきい値",
             "initial_prompt": "認識ヒント",
             "vad_filter": "VADで無音除外",
@@ -185,11 +217,11 @@ class VideoTranscriptionApp(QMainWindow):
             "セグメンテーションモデル": (
                 "音声区間の切り出し(セグメント化)に用いるモデル。"
             ),
-            "ja_weight": (
-                "日本語言語判定スコアへの補正係数。"
+            "lang1_weight": (
+                "言語1の言語判定スコアへの補正係数。"
             ),
-            "ru_weight": (
-                "ロシア語言語判定スコアへの補正係数。"
+            "lang2_weight": (
+                "言語2の言語判定スコアへの補正係数。"
             ),
             "default_languages": (
                 "起動時にチェックされる言語。複数選択可。"
@@ -307,24 +339,18 @@ class VideoTranscriptionApp(QMainWindow):
         time_layout.addWidget(self.total_time_label)
         control_layout.addLayout(time_layout)
 
-        button_layout = QHBoxLayout()
-        self.open_button = QPushButton("動画を開く")
-        self.open_button.clicked.connect(self.open_file)
-        button_layout.addWidget(self.open_button)
-
-        self.play_button = QPushButton()
-        self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.play_button.clicked.connect(self.play_pause)
-        self.play_button.setEnabled(False)
-        button_layout.addWidget(self.play_button)
-
-        self.stop_button = QPushButton()
-        self.stop_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_button.clicked.connect(self.stop_video)
-        self.stop_button.setEnabled(False)
-        button_layout.addWidget(self.stop_button)
-
+        # Unified toolbar: open / play / stop / seek buttons / export buttons
+        TOOL_BTN_HEIGHT = 32
         SEEK_BTN_WIDTH = 52
+
+        def make_tool_btn(label: str | None, icon: QStyle.StandardPixmap | None, tooltip: str, enabled: bool = True) -> QPushButton:
+            btn = QPushButton(label if label else "")
+            if icon is not None:
+                btn.setIcon(self.style().standardIcon(icon))
+            btn.setToolTip(tooltip)
+            btn.setEnabled(enabled)
+            btn.setFixedHeight(TOOL_BTN_HEIGHT)
+            return btn
 
         def make_seek_btn(label: str, delta_ms: int, tooltip: str) -> QPushButton:
             btn = QPushButton(label)
@@ -332,17 +358,51 @@ class VideoTranscriptionApp(QMainWindow):
             btn.setToolTip(tooltip)
             btn.clicked.connect(lambda _=None, d=delta_ms: self.seek_relative(d))
             btn.setFixedWidth(SEEK_BTN_WIDTH)
+            btn.setFixedHeight(TOOL_BTN_HEIGHT)
             return btn
 
-        self.seek_back_10_btn = make_seek_btn("◀10s", -10000, "10秒戻る")
-        self.seek_back_1_btn  = make_seek_btn("◀1s",  -1000,  "1秒戻る")
-        self.seek_fwd_1_btn   = make_seek_btn("1s▶",   1000,  "1秒進む")
-        self.seek_fwd_10_btn  = make_seek_btn("10s▶", 10000,  "10秒進む")
-        for btn in (self.seek_back_10_btn, self.seek_back_1_btn,
-                    self.seek_fwd_1_btn, self.seek_fwd_10_btn):
-            button_layout.addWidget(btn)
-        button_layout.addStretch()
-        control_layout.addLayout(button_layout)
+        toolbar = QHBoxLayout()
+        # Open button
+        self.open_button = make_tool_btn("動画を開く", None, "ファイルを開きます")
+        self.open_button.clicked.connect(self.open_file)
+        toolbar.addWidget(self.open_button)
+
+        # Play / Stop
+        self.play_button = make_tool_btn(None, QStyle.SP_MediaPlay, "再生 / 一時停止", False)
+        self.play_button.clicked.connect(self.play_pause)
+        toolbar.addWidget(self.play_button)
+
+        self.stop_button = make_tool_btn(None, QStyle.SP_MediaStop, "停止", False)
+        self.stop_button.clicked.connect(self.stop_video)
+        toolbar.addWidget(self.stop_button)
+
+        # Seek buttons
+        self.seek_back_10_btn = make_seek_btn("◀ 10s", -10000, "10秒戻る")
+        self.seek_back_1_btn  = make_seek_btn("◀ 1s",  -1000,  "1秒戻る")
+        self.seek_fwd_1_btn   = make_seek_btn("1s ▶",   1000,  "1秒進む")
+        self.seek_fwd_10_btn  = make_seek_btn("10s ▶", 10000,  "10秒進む")
+        for btn in (self.seek_back_10_btn, self.seek_back_1_btn, self.seek_fwd_1_btn, self.seek_fwd_10_btn):
+            toolbar.addWidget(btn)
+
+        toolbar.addStretch()
+
+        # Partial / Full export buttons (moved into toolbar so all target buttons align)
+        self.partial_export_button = QPushButton("部分書き出し")
+        self.partial_export_button.setEnabled(False)
+        self.partial_export_button.setToolTip(
+            "選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し"
+        )
+        self.partial_export_button.clicked.connect(self.partial_export_selected)
+        self.partial_export_button.setFixedHeight(TOOL_BTN_HEIGHT)
+        toolbar.addWidget(self.partial_export_button)
+
+        self.export_button = QPushButton("全文書き出し...")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_transcription)
+        self.export_button.setFixedHeight(TOOL_BTN_HEIGHT)
+        toolbar.addWidget(self.export_button)
+
+        control_layout.addLayout(toolbar)
         video_vlayout.addLayout(control_layout)
 
         # ---- テーブルコンテナ ----
@@ -351,20 +411,10 @@ class VideoTranscriptionApp(QMainWindow):
         table_vlayout.setContentsMargins(0, 0, 0, 0)
         table_vlayout.setSpacing(4)
 
+        # Keep an empty spacer area where export buttons used to be (buttons moved to toolbar)
         top_export_bar = QHBoxLayout()
         top_export_bar.setContentsMargins(0, 0, 0, 0)
         top_export_bar.addStretch()
-        self.partial_export_button = QPushButton("部分書き出し")
-        self.partial_export_button.setEnabled(False)
-        self.partial_export_button.setToolTip(
-            "選択された行範囲の音声(WAV)とテキスト(TXT)を ./output に書き出し"
-        )
-        self.partial_export_button.clicked.connect(self.partial_export_selected)
-        top_export_bar.addWidget(self.partial_export_button)
-        self.export_button = QPushButton("全文書き出し...")
-        self.export_button.setEnabled(False)
-        self.export_button.clicked.connect(self.export_transcription)
-        top_export_bar.addWidget(self.export_button)
         table_vlayout.addLayout(top_export_bar)
 
         self.transcription_table = QTableWidget()
@@ -375,8 +425,9 @@ class VideoTranscriptionApp(QMainWindow):
         """)
         self.transcription_table.setColumnCount(5)
         self.transcription_table.setHorizontalHeaderLabels(
-            ["START", "END", "JA%", "RU%", "TEXT"]
+            ["START", "END", "LANG1%", "LANG2%", "TEXT"]
         )
+        # ヘッダーのコード表示は言語設定後に _update_table_headers() で更新
         self.transcription_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.transcription_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.transcription_table.setSelectionMode(QTableWidget.ExtendedSelection)
@@ -429,7 +480,7 @@ class VideoTranscriptionApp(QMainWindow):
         # 右側: 設定パネル
         # ================================================================
         right_widget = QWidget()
-        fixed_settings_width = 350
+        fixed_settings_width = 320
         right_widget.setMinimumWidth(fixed_settings_width)
         right_widget.setMaximumWidth(fixed_settings_width)
         right_layout = QVBoxLayout(right_widget)
@@ -513,15 +564,39 @@ class VideoTranscriptionApp(QMainWindow):
         lang_group  = QGroupBox("言語設定")
         lang_layout = QVBoxLayout()
 
-        def make_lang_row(code: str, label_text: str, weight_key: str, prof: dict):
-            dlangs = prof.get("default_languages", ["ja", "ru"])
-            if not isinstance(dlangs, list) or not dlangs:
-                dlangs = ["ja"]
-            row = QWidget()
-            hl  = QHBoxLayout(row)
-            hl.setContentsMargins(0, 0, 0, 0)
-            chk = QCheckBox(label_text)
-            chk.setChecked(code in dlangs)
+        # プルダウン選択肢 ("code - 日本語名" 形式)
+        # advanced section (preferred) - fall back to legacy 'hidden' for compat
+        advanced_cfg = self.config.get("advanced", self.config.get("hidden", {})) if isinstance(self.config, dict) else {}
+        allowed_langs = advanced_cfg.get("available_languages")
+        if not isinstance(allowed_langs, list) or not allowed_langs:
+            allowed_langs = [
+                "en", "es", "it", "ja", "de", "zh",
+                "ru", "ko", "pt", "fr", "pl", "nl",
+            ]
+        lang_items = []
+        for code in allowed_langs:
+            if code in WHISPER_LANGUAGES:
+                name = WHISPER_LANGUAGES_JA.get(code, WHISPER_LANGUAGES[code])
+                lang_items.append((code, f"{code} - {name}"))
+
+        def make_lang_combo_row(default_code: str, weight_key: str, prof: dict,
+                                include_none: bool = False):
+            """言語コンボ + 重みスライダーの行を生成 (2 行レイアウト)。"""
+            row_w = QWidget()
+            vl = QVBoxLayout(row_w)
+            vl.setContentsMargins(0, 0, 0, 0)
+            vl.setSpacing(4)
+            combo = QComboBox()
+            if include_none:
+                combo.addItem("なし", None)
+            for code, label in lang_items:
+                combo.addItem(label, code)
+            # デフォルト選択
+            idx = combo.findData(default_code)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            elif not include_none:
+                combo.setCurrentIndex(0)
             slider = QSlider(Qt.Horizontal)
             slider.setMinimum(0); slider.setMaximum(10); slider.setSingleStep(1)
             slider.setFixedWidth(140)
@@ -530,52 +605,85 @@ class VideoTranscriptionApp(QMainWindow):
                 val = 0.5
             slider.setValue(int(round(val * 10)))
             value_label = QLabel(f"{val:.1f}")
-            
-            # スライダー変更時のハンドラは後で設定
-            hl.addWidget(chk)
-            hl.addWidget(QLabel("重み"))
-            hl.addWidget(slider)
-            hl.addWidget(value_label)
-            hl.addWidget(help_label(weight_key))
-            return chk, slider, value_label, row
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            top.addWidget(combo)
+            top.addStretch()
+            bottom = QHBoxLayout()
+            bottom.setContentsMargins(0, 0, 0, 0)
+            bottom.addWidget(QLabel("重み"))
+            bottom.addWidget(slider)
+            bottom.addWidget(value_label)
+            bottom.addWidget(help_label(weight_key))
+            vl.addLayout(top)
+            vl.addLayout(bottom)
+            return combo, slider, value_label, row_w
 
-        self.ja_check, self.ja_weight_slider, self.ja_weight_value_label, ja_row = \
-            make_lang_row("ja", "JA", "ja_weight", base_prof)
-        self.ru_check, self.ru_weight_slider, self.ru_weight_value_label, ru_row = \
-            make_lang_row("ru", "RU", "ru_weight", base_prof)
-        
-        # weightの合計が1.0になるように連動させる
-        def on_ja_weight_changed(v):
-            self.ja_weight_value_label.setText(f"{v/10:.1f}")
-            # RUスライダーを連動（無限ループ防止）
-            self.ru_weight_slider.blockSignals(True)
-            self.ru_weight_slider.setValue(10 - v)
-            self.ru_weight_value_label.setText(f"{(10-v)/10:.1f}")
-            self.ru_weight_slider.blockSignals(False)
-        
-        def on_ru_weight_changed(v):
-            self.ru_weight_value_label.setText(f"{v/10:.1f}")
-            # JAスライダーを連動（無限ループ防止）
-            self.ja_weight_slider.blockSignals(True)
-            self.ja_weight_slider.setValue(10 - v)
-            self.ja_weight_value_label.setText(f"{(10-v)/10:.1f}")
-            self.ja_weight_slider.blockSignals(False)
-        
-        self.ja_weight_slider.valueChanged.connect(on_ja_weight_changed)
-        self.ru_weight_slider.valueChanged.connect(on_ru_weight_changed)
-        
-        # 初期値を調整（合計1.0になるように）
-        ja_val = base_prof.get("ja_weight", 0.5)
-        ru_val = base_prof.get("ru_weight", 0.5)
-        total = ja_val + ru_val
+        dlangs = base_prof.get("default_languages", ["ja", "ru"])
+        default_lang1 = dlangs[0] if dlangs else "ja"
+        default_lang2 = dlangs[1] if len(dlangs) > 1 else "ru"
+
+        self.lang1_combo, self.lang1_weight_slider, self.lang1_weight_value_label, lang1_row = \
+            make_lang_combo_row(default_lang1, "lang1_weight", base_prof, include_none=False)
+        self.lang2_combo, self.lang2_weight_slider, self.lang2_weight_value_label, lang2_row = \
+            make_lang_combo_row(default_lang2, "lang2_weight", base_prof, include_none=True)
+
+        # BUG-6 修正: weight 連動スライダーは両方 blockSignals してから値を設定
+        def on_lang1_weight_changed(v):
+            self.lang1_weight_value_label.setText(f"{v/10:.1f}")
+            self.lang2_weight_slider.blockSignals(True)
+            self.lang1_weight_slider.blockSignals(True)
+            self.lang2_weight_slider.setValue(10 - v)
+            self.lang2_weight_value_label.setText(f"{(10-v)/10:.1f}")
+            self.lang2_weight_slider.blockSignals(False)
+            self.lang1_weight_slider.blockSignals(False)
+
+        def on_lang2_weight_changed(v):
+            self.lang2_weight_value_label.setText(f"{v/10:.1f}")
+            self.lang1_weight_slider.blockSignals(True)
+            self.lang2_weight_slider.blockSignals(True)
+            self.lang1_weight_slider.setValue(10 - v)
+            self.lang1_weight_value_label.setText(f"{(10-v)/10:.1f}")
+            self.lang1_weight_slider.blockSignals(False)
+            self.lang2_weight_slider.blockSignals(False)
+
+        self.lang1_weight_slider.valueChanged.connect(on_lang1_weight_changed)
+        self.lang2_weight_slider.valueChanged.connect(on_lang2_weight_changed)
+
+        # 初期値を正規化 (合計1.0)
+        w1 = base_prof.get("lang1_weight", 0.5)
+        w2 = base_prof.get("lang2_weight", 0.5)
+        total = (w1 or 0) + (w2 or 0)
         if total > 0:
-            ja_val = ja_val / total
-            ru_val = ru_val / total
-        self.ja_weight_slider.setValue(int(round(ja_val * 10)))
-        self.ru_weight_slider.setValue(int(round(ru_val * 10)))
-        
-        lang_layout.addWidget(ja_row)
-        lang_layout.addWidget(ru_row)
+            w1, w2 = w1 / total, w2 / total
+        self.lang1_weight_slider.setValue(int(round(w1 * 10)))
+        self.lang2_weight_slider.setValue(int(round(w2 * 10)))
+
+        def _sync_weights_for_none() -> None:
+            # lang2 が None のときは lang1=1.0, lang2=0.0 に固定
+            if self.lang2_combo.currentData() is None:
+                self.lang1_weight_slider.blockSignals(True)
+                self.lang2_weight_slider.blockSignals(True)
+                self.lang1_weight_slider.setValue(10)
+                self.lang2_weight_slider.setValue(0)
+                self.lang1_weight_value_label.setText("1.0")
+                self.lang2_weight_value_label.setText("0.0")
+                self.lang1_weight_slider.blockSignals(False)
+                self.lang2_weight_slider.blockSignals(False)
+                self.lang1_weight_slider.setEnabled(False)
+                self.lang2_weight_slider.setEnabled(False)
+            else:
+                self.lang1_weight_slider.setEnabled(True)
+                self.lang2_weight_slider.setEnabled(True)
+
+        # 言語変更でテーブルヘッダを更新
+        self.lang1_combo.currentIndexChanged.connect(self._update_table_headers)
+        self.lang2_combo.currentIndexChanged.connect(self._update_table_headers)
+        self.lang2_combo.currentIndexChanged.connect(_sync_weights_for_none)
+        _sync_weights_for_none()
+
+        lang_layout.addWidget(lang1_row)
+        lang_layout.addWidget(lang2_row)
         lang_group.setLayout(lang_layout)
         scroll_layout.addWidget(lang_group)
 
@@ -602,21 +710,24 @@ class VideoTranscriptionApp(QMainWindow):
                     combo.setCurrentText(val)
 
             dlangs = prof.get("default_languages", [])
-            if self.ja_check:
-                self.ja_check.setChecked("ja" in dlangs or not dlangs)
-            if self.ru_check:
-                self.ru_check.setChecked("ru" in dlangs)
+            if dlangs:
+                idx1 = self.lang1_combo.findData(dlangs[0])
+                if idx1 >= 0:
+                    self.lang1_combo.setCurrentIndex(idx1)
+                lang2_code = dlangs[1] if len(dlangs) > 1 else None
+                idx2 = self.lang2_combo.findData(lang2_code)  # None = "なし"
+                if idx2 >= 0:
+                    self.lang2_combo.setCurrentIndex(idx2)
 
-            # weightの合計が1.0になるように正規化
-            ja_w = prof.get("ja_weight", 0.5)
-            ru_w = prof.get("ru_weight", 0.5)
-            if isinstance(ja_w, (int, float)) and isinstance(ru_w, (int, float)):
-                total = ja_w + ru_w
+            # weight の合計が 1.0 になるように正規化
+            w1 = prof.get("lang1_weight", 0.5)
+            w2 = prof.get("lang2_weight", 0.5)
+            if isinstance(w1, (int, float)) and isinstance(w2, (int, float)):
+                total = w1 + w2
                 if total > 0:
-                    ja_w = ja_w / total
-                    ru_w = ru_w / total
-                self.ja_weight_slider.setValue(int(round(ja_w * 10)))
-                self.ru_weight_slider.setValue(int(round(ru_w * 10)))
+                    w1, w2 = w1 / total, w2 / total
+                self.lang1_weight_slider.setValue(int(round(w1 * 10)))
+                self.lang2_weight_slider.setValue(int(round(w2 * 10)))
 
             for key, ctrl in getattr(self, 'detail_controls', {}).items():
                 if key not in prof:
@@ -642,12 +753,14 @@ class VideoTranscriptionApp(QMainWindow):
         # ---- 詳細設定 ----
         detail_group  = QGroupBox("詳細設定")
         detail_layout = QVBoxLayout()
+        detail_layout.setContentsMargins(6, 6, 6, 6)
+        detail_layout.setSpacing(4)
         self.detail_controls: dict[str, QWidget] = {}
 
         # 基本設定グループで使用済みのキーは除外
         exclude_keys = {
             "device", "model",
-            "default_languages", "ja_weight", "ru_weight",
+            "default_languages", "lang1_weight", "lang2_weight",
               "vad_filter",
               "beam_size",  # 隠しパラメータダイアログで設定
         }
@@ -656,8 +769,8 @@ class VideoTranscriptionApp(QMainWindow):
         detail_keys_order = [
             "no_speech_threshold",  # 無音判定しきい値
             "vad_threshold",         # VAD閾値
-            "min_seg_dur",          # 最短発話長
-            "gap_threshold",        # 無音区切り
+            "vad_min_speech_ms",     # 最短発話長
+            "vad_min_silence_ms",    # 無音区切り
             "initial_prompt",       # 認識ヒント
         ]
 
@@ -676,7 +789,7 @@ class VideoTranscriptionApp(QMainWindow):
                 prompt_row_layout.addWidget(help_label(key))
                 detail_layout.addWidget(prompt_row)
                 txt = QTextEdit()
-                txt.setMaximumHeight(100)
+                txt.setMaximumHeight(80)
                 txt.setPlainText(value or "")
                 detail_layout.addWidget(txt)
                 self.detail_controls[key] = txt
@@ -770,9 +883,9 @@ class VideoTranscriptionApp(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_transcription)
         btn_row.addWidget(self.cancel_button)
         btn_row.addStretch()
-        self.hidden_params_button = QPushButton("隠しパラメータ...")
+        self.hidden_params_button = QPushButton("高度な設定...")
         self.hidden_params_button.clicked.connect(self._open_hidden_params_dialog)
-        self.hidden_params_button.setToolTip("Phase別beam_sizeなど上級者向けパラメータを編集")
+        self.hidden_params_button.setToolTip("Phase別beam_sizeなど高度な設定を編集")
         btn_row.addWidget(self.hidden_params_button)
         transcribe_layout.addLayout(btn_row)
 
@@ -816,12 +929,11 @@ class VideoTranscriptionApp(QMainWindow):
         self.media_player.durationChanged.connect(self._duration_changed)
         self.media_player.playbackStateChanged.connect(self._media_state_changed)
         self.position_slider.sliderMoved.connect(self._set_position)
-        self.ja_check.stateChanged.connect(self._ensure_language_selected)
-        self.ru_check.stateChanged.connect(self._ensure_language_selected)
         self.auto_sync_check.toggled.connect(self._on_auto_sync_toggled)
-        
+
         # UI初期化完了
         self._initializing = False
+        self._update_table_headers()
 
     # ================================================================
     # ヘルパー
@@ -899,8 +1011,7 @@ class VideoTranscriptionApp(QMainWindow):
                       and all(0 <= r < len(segs) for r in rows)):
                     can_dyn = True
             self.dynamic_split_button.setEnabled(can_dyn)
-        if hasattr(self, 'delete_button'):
-            self.delete_button.setEnabled(bool(rows) and not busy and bool(segs))
+        # delete_button removed; no longer present in UI
 
     def _start_watchdog(self) -> None:
         """ウォッチドッグタイマーを (再)起動する。"""
@@ -953,17 +1064,19 @@ class VideoTranscriptionApp(QMainWindow):
         """指定行のテーブルセルを最新の Segment 内容で部分更新。"""
         if row_index < 0 or row_index >= self.transcription_table.rowCount():
             return
-        ja_item  = QTableWidgetItem(f"{seg.ja_prob:.2f}")
-        ru_item  = QTableWidgetItem(f"{seg.ru_prob:.2f}")
+        p1 = seg.lang1_prob
+        p2 = seg.lang2_prob
+        item1 = QTableWidgetItem(f"{p1:.2f}")
+        item2 = QTableWidgetItem(f"{p2:.2f}")
         txt_item = QTableWidgetItem(display_text(seg))
-        if seg.ja_prob >= seg.ru_prob:
-            ja_item.setForeground(QColor(200, 0, 0))
-            ru_item.setForeground(QColor(0, 0, 180))
+        if p1 >= p2:
+            item1.setForeground(QColor(200, 0, 0))
+            item2.setForeground(QColor(0, 0, 180))
         else:
-            ru_item.setForeground(QColor(200, 0, 0))
-            ja_item.setForeground(QColor(0, 0, 180))
-        self.transcription_table.setItem(row_index, 2, ja_item)
-        self.transcription_table.setItem(row_index, 3, ru_item)
+            item2.setForeground(QColor(200, 0, 0))
+            item1.setForeground(QColor(0, 0, 180))
+        self.transcription_table.setItem(row_index, 2, item1)
+        self.transcription_table.setItem(row_index, 3, item2)
         self.transcription_table.setItem(row_index, 4, txt_item)
 
     # ================================================================
@@ -1028,12 +1141,20 @@ class VideoTranscriptionApp(QMainWindow):
         act_edit    = menu.addAction("このテキストを編集")
         act_re      = menu.addAction("これらの結合＆再文字起こし")
         act_dynamic = menu.addAction("現在位置で分割＆再文字起こし")
-        act_delete  = menu.addAction("選択行を削除")
+        # '選択行を削除' action removed per feature removal request
         
         menu.addSeparator()
         act_set_silence = menu.addAction("無音に設定")
-        act_retrans_ja  = menu.addAction("JAで強制再認識")
-        act_retrans_ru  = menu.addAction("RUで強制再認識")
+        # Show language names in Japanese if available (e.g. 日本語 / 英語)
+        lang1_code = self.lang1_combo.currentData() or 'ja'
+        lang1_name = WHISPER_LANGUAGES_JA.get(lang1_code, WHISPER_LANGUAGES.get(lang1_code, lang1_code))
+        act_retrans_lang1 = menu.addAction(f"{lang1_name}で強制再認識")
+        lang2 = self.lang2_combo.currentData()
+        if lang2:
+            lang2_name = WHISPER_LANGUAGES_JA.get(lang2, WHISPER_LANGUAGES.get(lang2, lang2))
+            act_retrans_lang2 = menu.addAction(f"{lang2_name}で強制再認識")
+        else:
+            act_retrans_lang2 = None
 
         # 進行中はすべて無効
         if getattr(self, 'range_retranscribing', False):
@@ -1069,15 +1190,14 @@ class VideoTranscriptionApp(QMainWindow):
         if not self._can_retranscribe_selection(rows):
             act_re.setEnabled(False)
 
-        # 削除
-        if not rows:
-            act_delete.setEnabled(False)
+        # 削除 action removed; nothing to enable/disable here
 
-        # 無音に設定、JA/RU強制再認識: 選択行があれば可能
+        # 無音に設定、LANG1/LANG2強制再認識: 選択行があれば可能
         if not rows or not all(0 <= r < len(segs) for r in rows):
             act_set_silence.setEnabled(False)
-            act_retrans_ja.setEnabled(False)
-            act_retrans_ru.setEnabled(False)
+            act_retrans_lang1.setEnabled(False)
+            if act_retrans_lang2:
+                act_retrans_lang2.setEnabled(False)
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -1100,17 +1220,16 @@ class VideoTranscriptionApp(QMainWindow):
         elif chosen == act_re and act_re.isEnabled():
             self.retranscribe_selected()
 
-        elif chosen == act_delete and act_delete.isEnabled():
-            self.delete_selected_segments()
+        # '選択行を削除' removed — no-op placeholder kept intentionally
 
         elif chosen == act_set_silence and act_set_silence.isEnabled():
             self.set_segments_silence(rows)
 
-        elif chosen == act_retrans_ja and act_retrans_ja.isEnabled():
-            self.retranscribe_as_language(rows, 'ja')
+        elif chosen == act_retrans_lang1 and act_retrans_lang1.isEnabled():
+            self.retranscribe_as_language(rows, self.lang1_combo.currentData() or 'ja')
 
-        elif chosen == act_retrans_ru and act_retrans_ru.isEnabled():
-            self.retranscribe_as_language(rows, 'ru')
+        elif act_retrans_lang2 and chosen == act_retrans_lang2 and act_retrans_lang2.isEnabled():
+            self.retranscribe_as_language(rows, self.lang2_combo.currentData())
 
     # ================================================================
     # 編集ダイアログ
@@ -1132,7 +1251,7 @@ class VideoTranscriptionApp(QMainWindow):
         self._open_edit_dialog_for_row(r)
 
     def _open_edit_dialog_for_row(self, row: int) -> None:
-        """指定行の EditDialog を開き、結果を transcription_result に反映する。"""
+        """指定行の EditDialog を開き、テキスト編集結果を transcription_result に反映する。"""
         if not self.transcription_result:
             return
         segs = self.transcription_result.get('segments', [])
@@ -1140,20 +1259,28 @@ class VideoTranscriptionApp(QMainWindow):
             return
         seg = segs[row]
 
-        dlg = EditDialog(seg, parent=self, dialog_size=self.split_dialog_size)
+        lang1_code = self.lang1_combo.currentData() or 'ja'
+        lang2_code = self.lang2_combo.currentData()  # may be None
+        dlg = EditDialog(seg, parent=self, dialog_size=self.split_dialog_size,
+                         lang1_code=lang1_code, lang2_code=lang2_code)
         if dlg.exec() != EditDialog.Accepted:
             return
 
-        if dlg.mode == 'split':
-            self.perform_segment_split(row, dlg.split_which, dlg.split_pos)
-
-        elif dlg.mode == 'edit':
-            seg['text_ja'] = dlg.new_text_ja
-            seg['text_ru'] = dlg.new_text_ru
-            seg['chosen_language'] = dlg.chosen_language
-            seg['text'] = dlg.new_text_ja if dlg.chosen_language == 'ja' else dlg.new_text_ru
-            self._rebuild_text_and_refresh()
-            self.status_label.setText("編集を保存しました")
+        # テキスト編集結果を反映
+        seg['text_lang1'] = dlg.new_text_lang1
+        seg['text_lang2'] = dlg.new_text_lang2
+        seg['chosen_language'] = dlg.chosen_language
+        # 選択した言語の認識率を100%、他方を0%に設定
+        if dlg.chosen_language == lang1_code:
+            seg['lang1_prob'] = 1.0
+            seg['lang2_prob'] = 0.0
+        else:
+            seg['lang1_prob'] = 0.0
+            seg['lang2_prob'] = 1.0
+        # 表示用 text も更新
+        seg['text'] = dlg.new_text_lang1 if dlg.chosen_language == lang1_code else dlg.new_text_lang2
+        self._rebuild_text_and_refresh()
+        self.status_label.setText("編集を保存しました")
 
     # ================================================================
     # 手動分割 / 境界調整 / 再文字起こし
@@ -1209,8 +1336,8 @@ class VideoTranscriptionApp(QMainWindow):
 
         # 分割直後は旧テキスト断片を消去してプレースホルダを表示
         for segx in (new_list[front_index], new_list[front_index + 1]):
-            segx['text'] = segx['text_ja'] = segx['text_ru'] = PLACEHOLDER_PENDING
-            segx['ja_prob'] = segx['ru_prob'] = 0.0
+            segx['text'] = segx['text_lang1'] = segx['text_lang2'] = PLACEHOLDER_PENDING
+            segx['lang1_prob'] = segx['lang2_prob'] = 0.0
             segx['chosen_language'] = None
 
         # テーブルのプレースホルダを即時反映
@@ -1254,9 +1381,18 @@ class VideoTranscriptionApp(QMainWindow):
         options = {
             'model':   self.model_combo.currentText(),
             'device':  self._get_selected_device(),
-            'ja_weight': self.ja_weight_slider.value() / 10.0,
-            'ru_weight': self.ru_weight_slider.value() / 10.0,
+            'lang1_weight': self.lang1_weight_slider.value() / 10.0,
+            'lang2_weight': self.lang2_weight_slider.value() / 10.0,
+            'lang1': self.lang1_combo.currentData() or 'ja',
+            'lang2': self.lang2_combo.currentData(),
         }
+        lang1 = self.lang1_combo.currentData() or 'ja'
+        lang2 = self.lang2_combo.currentData()
+        options['languages'] = [lang1] + ([lang2] if lang2 else [])
+        hidden = self.config.get('hidden', {}) if isinstance(self.config, dict) else {}
+        for k in ('debug_prob_log',):
+            if k in hidden:
+                options.setdefault(k, hidden[k])
         self._active_split_kind = kind
         self.range_thread = RangeTranscriptionThread(
             self.current_video_path, start_sec, end_sec, options
@@ -1280,34 +1416,43 @@ class VideoTranscriptionApp(QMainWindow):
 
         segs_obj = as_segment_list(self.transcription_result.get('segments', []))
         target_index = base_row if kind == 'front' else base_row + 1
+        is_silence = False
         if 0 <= target_index < len(segs_obj):
             tgt = segs_obj[target_index]
             tgt.update({
                 'text':     seg.get('text', ''),
-                'text_ja':  seg.get('text_ja', ''),
-                'text_ru':  seg.get('text_ru', ''),
-                'ja_prob':  float(seg.get('ja_prob', 0.0)),
-                'ru_prob':  float(seg.get('ru_prob', 0.0)),
+                'text_lang1':  seg.get('text_lang1', ''),
+                'text_lang2':  seg.get('text_lang2', ''),
+                'lang1_prob':  float(seg.get('lang1_prob', 0.0)),
+                'lang2_prob':  float(seg.get('lang2_prob', 0.0)),
+                'lang1_code':  seg.get('lang1_code', tgt.get('lang1_code', 'ja')),
+                'lang2_code':  seg.get('lang2_code', tgt.get('lang2_code', 'ru')),
                 'chosen_language': (
                     seg.get('chosen_language') or seg.get('language')
                     or tgt.get('chosen_language')
                 ),
             })
-            # テキストが両方空なら明示ラベル
-            if not tgt.text_ja and not tgt.text_ru:
-                tgt.text = tgt.text_ja = tgt.text_ru = '(空)'
-                tgt.ja_prob = tgt.ru_prob = 0.0
+            # テキストが両方空なら無音セグメント
+            is_silence = not tgt.text_lang1 and not tgt.text_lang2
+            if is_silence:
+                tgt.text = tgt.text_lang1 = tgt.text_lang2 = ''
+                tgt.chosen_language = 'silence'
+                tgt.lang1_prob = tgt.lang2_prob = 0.0
 
         try:
             self.transcription_result['segments'] = [s.to_dict() for s in segs_obj]
         except Exception:
             pass
 
-        # 対象行のみ部分更新
-        try:
-            self._update_table_row(target_index, segs_obj[target_index])
-        except Exception:
+        # 無音セグメント確定時はテーブル全体再構築（前のテキストが残るのを防止）
+        if is_silence:
             self._rebuild_text_and_refresh()
+        else:
+            # 通常は対象行のみ部分更新
+            try:
+                self._update_table_row(target_index, segs_obj[target_index])
+            except Exception:
+                self._rebuild_text_and_refresh()
 
         # 次ジョブへ or 全完了
         if getattr(self, '_pending_rejobs', None):
@@ -1347,8 +1492,8 @@ class VideoTranscriptionApp(QMainWindow):
         for r in rows:
             if 0 <= r < len(segs):
                 seg = segs[r]
-                if any(seg.get(k) for k in ('text', 'text_ja', 'text_ru')):
-                    seg['text'] = seg['text_ja'] = seg['text_ru'] = ''
+                if any(seg.get(k) for k in ('text', 'text_lang1', 'text_lang2')):
+                    seg['text'] = seg['text_lang1'] = seg['text_lang2'] = ''
                     changed += 1
         if changed == 0:
             return
@@ -1394,9 +1539,18 @@ class VideoTranscriptionApp(QMainWindow):
         options = {
             'model':     self.model_combo.currentText(),
             'device':    self._get_selected_device(),
-            'ja_weight': self.ja_weight_slider.value() / 10.0,
-            'ru_weight': self.ru_weight_slider.value() / 10.0,
+            'lang1_weight': self.lang1_weight_slider.value() / 10.0,
+            'lang2_weight': self.lang2_weight_slider.value() / 10.0,
+            'lang1': self.lang1_combo.currentData() or 'ja',
+            'lang2': self.lang2_combo.currentData(),
         }
+        lang1 = self.lang1_combo.currentData() or 'ja'
+        lang2 = self.lang2_combo.currentData()
+        options['languages'] = [lang1] + ([lang2] if lang2 else [])
+        hidden = self.config.get('hidden', {}) if isinstance(self.config, dict) else {}
+        for k in ('debug_prob_log',):
+            if k in hidden:
+                options.setdefault(k, hidden[k])
         start_sec = float(target[0].get('start', 0.0))
         end_sec   = float(target[-1].get('end', start_sec))
 
@@ -1418,10 +1572,12 @@ class VideoTranscriptionApp(QMainWindow):
                     if 0 <= idx < len(segs):
                         segs[idx].update({
                             'text':     seg_result.get('text', ''),
-                            'text_ja':  seg_result.get('text_ja', ''),
-                            'text_ru':  seg_result.get('text_ru', ''),
-                            'ja_prob':  seg_result.get('ja_prob', 0.0),
-                            'ru_prob':  seg_result.get('ru_prob', 0.0),
+                            'text_lang1':  seg_result.get('text_lang1', ''),
+                            'text_lang2':  seg_result.get('text_lang2', ''),
+                            'lang1_prob':  seg_result.get('lang1_prob', 0.0),
+                            'lang2_prob':  seg_result.get('lang2_prob', 0.0),
+                            'lang1_code':  seg_result.get('lang1_code', segs[idx].get('lang1_code', 'ja')),
+                            'lang2_code':  seg_result.get('lang2_code', segs[idx].get('lang2_code')),
                             'chosen_language': seg_result.get(
                                 'chosen_language', segs[idx].get('chosen_language')
                             ),
@@ -1459,8 +1615,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.transcription_result['segments'] = merged_list
         try:
             ph = self.transcription_result['segments'][insert_index]
-            ph['text'] = ph['text_ja'] = ph['text_ru'] = PLACEHOLDER_PENDING
-            ph['ja_prob'] = ph['ru_prob'] = 0.0
+            ph['text'] = ph['text_lang1'] = ph['text_lang2'] = PLACEHOLDER_PENDING
+            ph['lang1_prob'] = ph['lang2_prob'] = 0.0
             ph['chosen_language'] = None
         except Exception:
             pass
@@ -1503,18 +1659,26 @@ class VideoTranscriptionApp(QMainWindow):
         new_segments: list[dict] = []
         for idx, s in enumerate(orig_segs):
             if idx == first:
+                # BUG-2 修正: Segment オブジェクトか dict かどちらでも安全に取得
+                s_dict = s.to_dict() if hasattr(s, 'to_dict') else s
                 new_segments.append({
                     'start': new_seg['start'], 'end': new_seg['end'],
-                    'text': new_seg['text'], 'text_ja': new_seg['text_ja'],
-                    'text_ru': new_seg['text_ru'],
+                    'text': new_seg['text'],
+                    'text_lang1': new_seg.get('text_lang1', ''),
+                    'text_lang2': new_seg.get('text_lang2', ''),
                     'chosen_language': new_seg['chosen_language'],
-                    'id': s.get('id', idx),
-                    'ja_prob': new_seg['ja_prob'], 'ru_prob': new_seg['ru_prob'],
+                    'id': s_dict.get('id', idx),
+                    'lang1_prob': new_seg.get('lang1_prob', 0.0),
+                    'lang2_prob': new_seg.get('lang2_prob', 0.0),
+                    'lang1_code': new_seg.get('lang1_code',
+                        s_dict.get('lang1_code', self.lang1_combo.currentData() or 'ja')),
+                    'lang2_code': new_seg.get('lang2_code',
+                        s_dict.get('lang2_code', self.lang2_combo.currentData())),
                 })
             elif idx in rows_sorted[1:]:
                 continue  # 縮約されたので除去
             else:
-                new_segments.append(s)
+                new_segments.append(s.to_dict() if hasattr(s, 'to_dict') else s)
 
         self.transcription_result['segments'] = new_segments
         self._rebuild_text_and_refresh()
@@ -1541,11 +1705,11 @@ class VideoTranscriptionApp(QMainWindow):
         for r in rows:
             if 0 <= r < len(segs):
                 segs[r]['text'] = ''
-                segs[r]['text_ja'] = ''
-                segs[r]['text_ru'] = ''
+                segs[r]['text_lang1'] = ''
+                segs[r]['text_lang2'] = ''
                 segs[r]['chosen_language'] = 'silence'
-                segs[r]['ja_prob'] = 0.0
-                segs[r]['ru_prob'] = 0.0
+                segs[r]['lang1_prob'] = 0.0
+                segs[r]['lang2_prob'] = 0.0
         
         self._rebuild_text_and_refresh()
         self.status_label.setText(f"{len(rows)}行を無音に設定しました")
@@ -1574,13 +1738,18 @@ class VideoTranscriptionApp(QMainWindow):
         
         segs = as_segment_list(self.transcription_result.get('segments', []))
         
-        # オプション準備（合計1.0になるように設定）
+        # オプション準備 (合計1.0になるように設定)
         options = {
             'model': self.model_combo.currentText(),
             'device': self._get_selected_device(),
-            'ja_weight': 0.999 if lang == 'ja' else 0.001,
-            'ru_weight': 0.999 if lang == 'ru' else 0.001,
+            'lang1_weight': 0.999 if lang == self.lang1_combo.currentData() else 0.001,
+            'lang2_weight': 0.001 if lang == self.lang1_combo.currentData() else 0.999,
         }
+        options['languages'] = [lang]
+        hidden = self.config.get('hidden', {}) if isinstance(self.config, dict) else {}
+        for k in ('debug_prob_log',):
+            if k in hidden:
+                options.setdefault(k, hidden[k])
         
         # 各行を個別に再認識
         self.range_retranscribing = True
@@ -1624,16 +1793,27 @@ class VideoTranscriptionApp(QMainWindow):
         def on_finished(result: dict) -> None:
             try:
                 # 結果を反映（確率を100%に強制設定）
-                if lang == 'ja':
-                    segs[row_idx]['ja_prob'] = 100.0
-                    segs[row_idx]['ru_prob'] = 0.0
+                if lang == self.lang1_combo.currentData():
+                    segs[row_idx]['lang1_prob'] = 100.0
+                    segs[row_idx]['lang2_prob'] = 0.0
                 else:
-                    segs[row_idx]['ja_prob'] = 0.0
-                    segs[row_idx]['ru_prob'] = 100.0
+                    segs[row_idx]['lang1_prob'] = 0.0
+                    segs[row_idx]['lang2_prob'] = 100.0
                 
                 segs[row_idx]['text'] = result.get('text', '')
-                segs[row_idx]['text_ja'] = result.get('text_ja', '')
-                segs[row_idx]['text_ru'] = result.get('text_ru', '')
+                # transcribe_range() が単言語 [lang] で実行された場合、
+                # 結果の言語コードが UI側の言語構成と異なる場合があるため、正しいフィールドに割り当てる
+                lang1_code = self.lang1_combo.currentData() or 'ja'
+                lang2_code = self.lang2_combo.currentData()
+                result_lang1_code = result.get('lang1_code', 'ja')
+                
+                # 結果の lang1_code が UI側の lang2_code と一致する場合、フィールドを反転
+                if result_lang1_code == lang2_code:
+                    segs[row_idx]['text_lang1'] = result.get('text_lang2', '')
+                    segs[row_idx]['text_lang2'] = result.get('text_lang1', '')
+                else:
+                    segs[row_idx]['text_lang1'] = result.get('text_lang1', '')
+                    segs[row_idx]['text_lang2'] = result.get('text_lang2', '')
                 segs[row_idx]['chosen_language'] = lang
                 
                 self.transcription_result['segments'] = [s.to_dict() for s in segs]
@@ -1852,39 +2032,56 @@ class VideoTranscriptionApp(QMainWindow):
             self.status_label.setText("書き出し失敗")
 
     # ================================================================
-    # 隠しパラメータ設定
+    # 高度な設定
     # ================================================================
 
     def _open_hidden_params_dialog(self) -> None:
-        """隠しパラメータダイアログを開き、設定を config.toml の [hidden] に保存する。"""
-        current_hidden = self.config.get("hidden", {})
+        """高度な設定ダイアログを開き、設定を config.toml の [advanced] に保存する。"""
+        # provide advanced (preferred) or fall back to legacy hidden section
+        current_hidden = self.config.get("advanced", self.config.get("hidden", {}))
         
         dialog = HiddenParamsDialog(current_hidden, self)
         if dialog.exec() == HiddenParamsDialog.Accepted:
             new_values = dialog.get_values()
             
-            # config.toml を更新
+            # config.toml を更新 (tomlkit使用で堅牢化)
             try:
+                import tomlkit
+                
                 cfg_path = os.path.join(os.path.dirname(__file__), "..", "config.toml")
                 cfg_path = os.path.normpath(cfg_path)
                 
-                # 既存のconfig.tomlをテキストとして読み込み
+                # 既存のconfig.tomlを読み込み (コメント・書式を保持)
                 with open(cfg_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                    doc = tomlkit.load(f)
                 
-                # hiddenセクションの各パラメータを正規表現で置換
-                import re
+                # ensure [advanced] exists (preferred)
+                if "advanced" not in doc:
+                    doc["advanced"] = tomlkit.table()
+
+                # ensure nested [advanced.logging] exists for logging-related keys
+                if "logging" not in doc["advanced"] or not isinstance(doc["advanced"].get("logging"), dict):
+                    doc["advanced"]["logging"] = tomlkit.table()
+
+                # Map logging-related flat keys into the nested logging table
+                LOG_KEY_MAP = {
+                    "log_file_enabled": "file_enabled",
+                    "log_level": "level",
+                    "log_file_path": "file_path",
+                    "log_max_bytes": "max_bytes",
+                    "log_backup_count": "backup_count",
+                }
+
+                # 各パラメータを更新
                 for key, val in new_values.items():
-                    # TOML形式の値に変換
-                    toml_val = self._toml_value(val)
-                    # パターン: "key = 既存値" を "key = 新値" に置換
-                    pattern = rf'^{re.escape(key)}\s*=\s*.*$'
-                    replacement = f'{key} = {toml_val}'
-                    content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+                    if key in LOG_KEY_MAP:
+                        doc["advanced"]["logging"][LOG_KEY_MAP[key]] = val
+                    else:
+                        doc["advanced"][key] = val
                 
-                # ファイルに書き戻し
+                # ファイルに書き戻し (書式・コメント保持)
                 with open(cfg_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                    tomlkit.dump(doc, f)
                 
                 # メモリ上のconfigも更新
                 with open(cfg_path, "rb") as f:
@@ -1893,16 +2090,16 @@ class VideoTranscriptionApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "保存完了",
-                    "隠しパラメータを config.toml に保存しました。\n次回の文字起こしから反映されます。"
+                    "高度な設定を config.toml の [advanced] セクションに保存しました。\n次回の文字起こしから反映されます。"
                 )
-                logger.info(f"[HIDDEN] Updated hidden params: {new_values}")
+                logger.info(f"[ADVANCED] Updated advanced params: {new_values}")
                 
             except Exception as e:
                 logger.exception("Failed to save hidden params")
                 QMessageBox.critical(
                     self,
                     "保存エラー",
-                    f"隠しパラメータの保存に失敗しました: {e}"
+                    f"高度な設定の保存に失敗しました: {e}"
                 )
     
     def _toml_value(self, val) -> str:
@@ -1936,11 +2133,19 @@ class VideoTranscriptionApp(QMainWindow):
             self.transcription_table.setRowCount(0)
             self.transcription_result = {'text': '', 'segments': []}
 
-        selected_langs = []
-        if self.ja_check.isChecked():
-            selected_langs.append("ja")
-        if self.ru_check.isChecked():
-            selected_langs.append("ru")
+        # 言語選択: lang1 は必須, lang2 は None ("なし") 時は单言語モード
+        lang1 = self.lang1_combo.currentData()
+        lang2 = self.lang2_combo.currentData()  # None if "なし"
+        selected_langs = [lang1] + ([lang2] if lang2 else [])
+
+        # バリデーション: lang1 と lang2 が同じになっていないか確認
+        if lang2 is not None and lang1 == lang2:
+            QMessageBox.critical(
+                self,
+                "言語設定エラー",
+                "言語1と言語2に同じ言語が選択されています。別の言語を選択してください。",
+            )
+            return
 
         # 詳細設定ウィジェット値を収集
         detail_values: dict = {}
@@ -1960,15 +2165,15 @@ class VideoTranscriptionApp(QMainWindow):
                 else:
                     detail_values[key] = ctrl.currentText()
 
-            # VAD は常に有効
-            detail_values["vad_filter"] = True
+        # VAD は常に有効 (ループ外へ移動 BUG-15付近の修正)
+        detail_values["vad_filter"] = True
 
         options: dict = {
             "model":    self.model_combo.currentText(),
             "device":   self._get_selected_device(),
             "languages": selected_langs,
-            "ja_weight": self.ja_weight_slider.value() / 10.0,
-            "ru_weight": self.ru_weight_slider.value() / 10.0,
+            "lang1_weight": self.lang1_weight_slider.value() / 10.0,
+            "lang2_weight": self.lang2_weight_slider.value() / 10.0,
         }
         options.update(detail_values)
 
@@ -1977,7 +2182,8 @@ class VideoTranscriptionApp(QMainWindow):
         for k in ('ambiguous_threshold', 'condition_on_previous_text',
                   'compression_ratio_threshold', 'log_prob_threshold',
                   'repetition_penalty', 'speech_pad_ms', 'duplicate_merge',
-                  'phase1_beam_size', 'phase2_detect_beam_size', 'phase2_retranscribe_beam_size'):
+                  'phase1_beam_size', 'phase2_detect_beam_size', 'phase2_retranscribe_beam_size',
+                  'debug_prob_log',):
             if k in hidden:
                 options.setdefault(k, hidden[k])
 
@@ -2048,7 +2254,7 @@ class VideoTranscriptionApp(QMainWindow):
                 return
             segs = self.transcription_result.get('segments', []) if self.transcription_result else []
             segs.append(seg_dict)
-            line = display_text(seg_dict)
+            line = display_text(seg_dict)  # BUG-15 修正: display_text() を使用
             if line:
                 prev_text = self.transcription_result.get('text', '') if self.transcription_result else ''
                 self.transcription_result['text'] = (
@@ -2060,22 +2266,18 @@ class VideoTranscriptionApp(QMainWindow):
             ed_str = format_ms(int(seg_dict.get('end',   0.0) * 1000))
             start_item = QTableWidgetItem(st_str)
             end_item = QTableWidgetItem(ed_str)
-            ja_item = QTableWidgetItem(f"{seg_dict.get('ja_prob', 0.0):.2f}")
-            ru_item = QTableWidgetItem(f"{seg_dict.get('ru_prob', 0.0):.2f}")
-            text_item = QTableWidgetItem(seg_dict.get('text', ''))
-            for it in (start_item, end_item, ja_item, ru_item):
+            p1 = seg_dict.get('lang1_prob', 0.0)
+            p2 = seg_dict.get('lang2_prob', 0.0)
+            item1 = QTableWidgetItem(f"{p1:.2f}")
+            item2 = QTableWidgetItem(f"{p2:.2f}")
+            text_item = QTableWidgetItem(line)  # BUG-15: display_text result
+            for it in (start_item, end_item, item1, item2):
                 it.setTextAlignment(Qt.AlignCenter)
-            apply_prob_colors(
-                self.transcription_table,
-                ja_item,
-                ru_item,
-                seg_dict.get('ja_prob', 0.0),
-                seg_dict.get('ru_prob', 0.0),
-            )
+            apply_prob_colors(self.transcription_table, item1, item2, p1, p2)
             self.transcription_table.setItem(row, 0, start_item)
             self.transcription_table.setItem(row, 1, end_item)
-            self.transcription_table.setItem(row, 2, ja_item)
-            self.transcription_table.setItem(row, 3, ru_item)
+            self.transcription_table.setItem(row, 2, item1)
+            self.transcription_table.setItem(row, 3, item2)
             self.transcription_table.setItem(row, 4, text_item)
             self.status_label.setText(f"文字起こし中... ({len(segs)})")
         except Exception:
@@ -2180,13 +2382,14 @@ class VideoTranscriptionApp(QMainWindow):
     def _set_position(self, position: int) -> None:
         self.media_player.setPosition(position)
 
-    def _ensure_language_selected(self) -> None:
-        """少なくとも 1 言語が選択された状態を維持する。"""
-        QTimer.singleShot(0, self._ensure_language_selected_late)
-
-    def _ensure_language_selected_late(self) -> None:
-        if not (self.ja_check.isChecked() or self.ru_check.isChecked()):
-            self.ja_check.setChecked(True)
+    def _update_table_headers(self) -> None:
+        """言語設定変更時にテーブルヘッダーのコードを更新する。"""
+        lang1 = self.lang1_combo.currentData() or 'LANG1'
+        lang2 = self.lang2_combo.currentData()
+        lbl2 = f"{lang2.upper()}%" if lang2 else "LANG2%"
+        self.transcription_table.setHorizontalHeaderLabels(
+            ["START", "END", f"{lang1.upper()}%", lbl2, "TEXT"]
+        )
 
     def _on_auto_sync_toggled(self, checked: bool) -> None:
         """自動同期 ON 時: 再生中なら即座に現在位置で同期する。"""
@@ -2200,6 +2403,87 @@ class VideoTranscriptionApp(QMainWindow):
                     self.sync_table_selection_with_position(pos)
         except Exception:
             pass
+
+    def closeEvent(self, event) -> None:
+        """Ensure background transcription threads are stopped and models
+        are unloaded before the application exits. Shows a small waiting
+        dialog while shutdown proceeds.
+        """
+        # Stop media playback early to reduce active device usage
+        try:
+            try:
+                # prefer using our stop helper if available
+                self.stop_video()
+            except Exception:
+                # fallback: stop media player directly
+                try:
+                    self.media_player.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Collect running transcription threads
+        threads = []
+        if getattr(self, 'transcription_thread', None) and self.transcription_thread.isRunning():
+            threads.append(self.transcription_thread)
+        if getattr(self, 'range_thread', None) and self.range_thread.isRunning():
+            threads.append(self.range_thread)
+
+        if threads:
+            from PySide6.QtWidgets import QMessageBox
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle('終了処理中')
+            dlg.setText('処理を終了しています。しばらくお待ちください...')
+            dlg.setStandardButtons(QMessageBox.NoButton)
+            dlg.setModal(True)
+            dlg.show()
+
+            # Request cancel on threads
+            for t in threads:
+                try:
+                    if hasattr(t, 'request_cancel'):
+                        t.request_cancel()
+                except Exception:
+                    pass
+
+            # Wait up to 20s for threads to finish, checking periodically
+            total_wait = 0
+            timeout_ms = 20000
+            interval = 250
+            while any(t.isRunning() for t in threads) and total_wait < timeout_ms:
+                for t in threads:
+                    try:
+                        t.wait(interval)
+                    except Exception:
+                        pass
+                QApplication.processEvents()
+                total_wait += interval
+
+            dlg.close()
+
+        # Additional short wait and GC before clearing models
+        try:
+            QApplication.processEvents()
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # Clear model cache now that threads are stopped. Use GC pass
+        # afterwards to ensure native destructors run on the main thread.
+        try:
+            import transcription.model_cache as model_cache
+            model_cache.clear_cache()
+        except Exception:
+            logger.exception('Failed to clear model cache during shutdown')
+
+        try:
+            gc.collect()
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+        super().closeEvent(event)
 
     def _on_device_changed(self, *_args) -> None:
         """デバイス変更時の処理"""

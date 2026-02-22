@@ -1,9 +1,10 @@
 """セグメント関連の共通ユーティリティ。
 
 display_text(segment):
-    - GAP 行は空文字を返す (特別表示しない簡潔仕様)
+    - GAP 行は「[無音]」を返す (BUG-7 修正: silence と統一)
     - chosen_language 優先
-    - それ以外は ja_prob >= ru_prob で fallback
+    - chosen_language='other' の場合は Phase1 テキスト (text フィールド) を使用
+    - それ以外は lang1_prob >= lang2_prob で fallback
 
 normalize_segment_id(segment, fallback_id):
     - segment['id'] を int 化。失敗したら fallback_id を返す。
@@ -17,29 +18,48 @@ __all__ = ["display_text", "normalize_segment_id"]
 def display_text(seg: Dict[str, Any]) -> str:
     if not seg:
         return ""
+    # GAP と silence は両方とも「[無音]」表示 (BUG-7 修正)
     if seg.get("gap"):
-        return ""  # GAP は空文字表示
-    # 無音セグメントは「[無音]」と表示
+        return "[無音]"
     if seg.get("chosen_language") == "silence":
         return "[無音]"
     # プレースホルダ (再解析中) はそのまま表示
-    for key in ('text', 'text_ja', 'text_ru'):
+    for key in ('text', 'text_lang1', 'text_lang2'):
         v = seg.get(key)
         if isinstance(v, str) and v.startswith('[再解析中]'):
             return v
     chosen = seg.get("chosen_language")
-    ja = seg.get("text_ja", "") or ""
-    ru = seg.get("text_ru", "") or ""
-    jp = seg.get("ja_prob", 0.0) or 0.0
-    rp = seg.get("ru_prob", 0.0) or 0.0
-    if chosen == 'ja' and ja:
-        return ja
-    if chosen == 'ru' and ru:
-        return ru
-    # fallback
-    if jp >= rp:
-        return ja or ru
-    return ru or ja
+    lang1_code = seg.get("lang1_code", "ja")
+    lang2_code = seg.get("lang2_code", "ru")
+    t1 = seg.get("text_lang1", "") or ""
+    t2 = seg.get("text_lang2", "") or ""
+    base = seg.get('text', '') or ''
+    p1 = seg.get("lang1_prob", 0.0) or 0.0
+    p2 = seg.get("lang2_prob", 0.0) or 0.0
+    if chosen and chosen not in {lang1_code, lang2_code, 'other', 'silence'}:
+        prefix = f"[{str(chosen).upper()}?]"
+        base = seg.get('text', '') or ''
+        if base.startswith(prefix):
+            return base
+        return f"{prefix} {base}".strip()
+    # 'other' = 選択外言語確定 → Phase1 テキスト (text フィールド) を保持
+    if chosen == 'other':
+        return seg.get('text', '') or ''
+    if chosen == lang1_code and t1:
+        return t1
+    if chosen == lang2_code and t2:
+        return t2
+    # If the chosen language's language-specific field is empty but the
+    # generic `text` field contains content (e.g. forced re-recognition
+    # updated only `text`), prefer that as a sensible fallback so the
+    # UI doesn't display an empty line.
+    if base:
+        return base
+
+    # fallback to whichever lang text is available
+    if p1 >= p2:
+        return t1 or t2
+    return t2 or t1
 
 
 def normalize_segment_id(seg: Dict[str, Any], fallback_id: int) -> int:
