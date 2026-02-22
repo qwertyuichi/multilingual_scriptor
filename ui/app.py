@@ -19,7 +19,12 @@ import sys
 import time
 import tomllib as _toml
 
-import torch
+try:
+    import ctranslate2
+    _CUDA_AVAILABLE = ctranslate2.get_cuda_device_count() > 0
+except Exception:
+    _CUDA_AVAILABLE = False
+
 from PySide6.QtCore import Qt, QTimer, QUrl, Slot, QLoggingCategory
 from PySide6.QtGui import QColor
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -217,7 +222,7 @@ class VideoTranscriptionApp(QMainWindow):
                 "両(複数)言語再トライ比較を行う境界。"
             ),
             "vad_level": (
-                "WebRTC VAD (Voice Activity Detection) 感度。\n"
+                "VAD (Voice Activity Detection) 感度。\n"
                 "0: もっとも寛容  3: 最も厳格"
             ),
             "gap_threshold": (
@@ -458,7 +463,7 @@ class VideoTranscriptionApp(QMainWindow):
         model_layout.addWidget(QLabel("デバイス:"), 1, 0)
         self.device_combo = QComboBox()
         device_items = [("CPU", "cpu")]
-        if torch.cuda.is_available():
+        if _CUDA_AVAILABLE:
             device_items.append(("GPU", "cuda"))
         for label, value in device_items:
             self.device_combo.addItem(label, value)
@@ -751,7 +756,7 @@ class VideoTranscriptionApp(QMainWindow):
 
         scroll_widget.setLayout(scroll_layout)
         scroll_area.setWidget(scroll_widget)
-        right_layout.addWidget(scroll_area)
+        right_layout.addWidget(scroll_area, 1)
 
         # ---- 文字起こし実行エリア ----
         transcribe_layout = QVBoxLayout()
@@ -780,27 +785,23 @@ class VideoTranscriptionApp(QMainWindow):
         self.status_label.setMinimumHeight(22)
         transcribe_layout.addWidget(self.status_label)
 
-        # 折りたたみ可能ログパネル
+        # ログパネル（常時表示）
         self.log_panel_container = QWidget()
         log_layout = QVBoxLayout(self.log_panel_container)
         log_layout.setContentsMargins(0, 0, 0, 0)
-        toggle_row = QHBoxLayout()
-        self.toggle_log_button = QPushButton("▼ ログ表示")
-        self.toggle_log_button.setCheckable(True)
-        self.toggle_log_button.setChecked(False)
-        self.toggle_log_button.toggled.connect(self._toggle_log_panel)
-        toggle_row.addWidget(self.toggle_log_button)
-        toggle_row.addStretch()
-        log_layout.addLayout(toggle_row)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setVisible(False)
+        self.log_text.setVisible(True)
         self.log_text.setStyleSheet(
             "QTextEdit { font-family: Consolas, 'Courier New', monospace; font-size:11px; }"
         )
+        self.log_panel_container.setMinimumHeight(80)
+        self.log_panel_container.setMaximumHeight(120)
+        self.log_text.setMinimumHeight(80)
+        self.log_text.setMaximumHeight(120)
         log_layout.addWidget(self.log_text)
         transcribe_layout.addWidget(self.log_panel_container)
-        right_layout.addLayout(transcribe_layout)
+        right_layout.addLayout(transcribe_layout, 0)
 
         # ---- 左右スプリッター ----
         splitter = QSplitter(Qt.Horizontal)
@@ -2094,12 +2095,14 @@ class VideoTranscriptionApp(QMainWindow):
     def _on_device_fallback(self) -> None:
         """GPU→CPUフォールバック警告"""
         from PySide6.QtWidgets import QMessageBox
+        
         QMessageBox.warning(
             self,
             "デバイスフォールバック警告",
             "GPUが利用できないため、CPUモードで処理を実行しました。\n\n"
             "CPUモードでは処理速度が大幅に低下します。\n"
-            "GPUを使用するには、CUDAドライバーとライブラリが正しくインストールされていることを確認してください。"
+            "GPUを使用するには、CUDA Toolkit (NVIDIA の場合) または ROCm SDK (AMD の場合) "
+            "が正しくインストールされていることを確認してください。"
         )
 
     # ================================================================
@@ -2215,9 +2218,7 @@ class VideoTranscriptionApp(QMainWindow):
                 "可能であればCUDAを使用することを推奨します。"
             )
 
-    def _toggle_log_panel(self, checked: bool) -> None:
-        self.log_text.setVisible(checked)
-        self.toggle_log_button.setText("▲ ログ非表示" if checked else "▼ ログ表示")
+
 
     def display_transcription(self, result: dict) -> None:
         """テーブルにセグメントを表示する。"""

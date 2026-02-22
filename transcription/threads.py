@@ -6,6 +6,12 @@
 """
 from __future__ import annotations
 
+try:
+    import ctranslate2
+    _CUDA_AVAILABLE = ctranslate2.get_cuda_device_count() > 0
+except Exception:
+    _CUDA_AVAILABLE = False
+
 from PySide6.QtCore import QThread, Signal
 
 from transcription.processor import advanced_process_video, transcribe_range
@@ -48,6 +54,12 @@ class TranscriptionThread(QThread):
 
     def run(self) -> None:
         try:
+            # デバイスフォールバックの事前チェック（文字起こし開始前に警告）
+            requested_device = self.options.get('device', 'cuda')
+            if requested_device == 'cuda' and not _CUDA_AVAILABLE:
+                logger.warning('[THREAD] CUDAが要求されましたがCPUにフォールバックします')
+                self.device_fallback_warning.emit()
+            
             self.status.emit("文字起こし開始準備中...")
             self.progress.emit(5)
             result = advanced_process_video(
@@ -82,10 +94,6 @@ class TranscriptionThread(QThread):
             else:
                 self.status.emit("文字起こし完了")
             
-            # デバイスフォールバック警告
-            if result.get('device_fallback', False):
-                self.device_fallback_warning.emit()
-            
             self.finished_transcription.emit(result)
         except Exception as e:
             logger.exception("[ERROR] TranscriptionThread exception:")
@@ -119,6 +127,12 @@ class RangeTranscriptionThread(QThread):
 
     def run(self) -> None:
         try:
+            # デバイスフォールバックの事前チェック（再文字起こし開始前に警告）
+            requested_device = self.options.get('device', 'cuda')
+            if requested_device == 'cuda' and not _CUDA_AVAILABLE:
+                logger.warning('[THREAD] CUDAが要求されましたがCPUにフォールバックします')
+                self.device_fallback_warning.emit()
+            
             res = transcribe_range(
                 self.video_path,
                 self.start_sec,
@@ -136,10 +150,6 @@ class RangeTranscriptionThread(QThread):
             )
             self.progress.emit(100)
             self.status.emit('部分再文字起こし完了')
-            
-            # デバイスフォールバック警告
-            if res.get('device_fallback', False):
-                self.device_fallback_warning.emit()
             
             self.range_finished.emit(res)
         except Exception as e:

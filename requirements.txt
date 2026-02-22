@@ -1,6 +1,2 @@
 faster-whisper
-torch
-numpy
-scipy
-webrtcvad
 PySide6

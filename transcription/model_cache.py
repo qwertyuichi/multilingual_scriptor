@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-import torch
 from faster_whisper import WhisperModel
 
 from core.constants import DEFAULT_MODEL_CACHE_LIMIT
@@ -52,11 +51,6 @@ def _load_cached_model(
     while len(_MODEL_CACHE) >= DEFAULT_MODEL_CACHE_LIMIT:
         evict_key, _ = _MODEL_CACHE.popitem(last=False)
         logger.info(f"[MODEL_CACHE] evict: {evict_key}")
-        if evict_key[1] == "cuda":
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
 
     logger.info(f"[MODEL_CACHE] loading model size={model_size} device={device} compute_type={resolved_ct}")
     model = WhisperModel(

@@ -13,7 +13,11 @@ import subprocess
 import tempfile
 from typing import Callable, Optional
 
-import torch
+try:
+    import ctranslate2
+    _CUDA_AVAILABLE = ctranslate2.get_cuda_device_count() > 0
+except Exception:
+    _CUDA_AVAILABLE = False
 
 from faster_whisper.audio import decode_audio as fw_decode_audio
 
@@ -82,9 +86,9 @@ def advanced_process_video(
     multilingual = True
 
     # デバイス決定
-    selected_device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    selected_device = device or ('cuda' if _CUDA_AVAILABLE else 'cpu')
     device_fallback = False
-    if selected_device == 'cuda' and not torch.cuda.is_available():
+    if selected_device == 'cuda' and not _CUDA_AVAILABLE:
         logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
         selected_device = 'cpu'
         device_fallback = True
@@ -459,9 +463,9 @@ def transcribe_range(
     if status_callback:
         status_callback('部分再文字起こし: モデル取得中...')
 
-    dev = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    dev = device or ('cuda' if _CUDA_AVAILABLE else 'cpu')
     device_fallback = False
-    if dev == 'cuda' and not torch.cuda.is_available():
+    if dev == 'cuda' and not _CUDA_AVAILABLE:
         logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
         dev = 'cpu'
         device_fallback = True
