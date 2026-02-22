@@ -29,6 +29,9 @@ MAX_RANGE_SEC = 30.0
 # モデルキャッシュ上限 (LRU)
 DEFAULT_MODEL_CACHE_LIMIT = 2
 
+# 無音区間の最小長さ (秒: 転写結果に無音セグメントを挿入する境界)
+SILENCE_MIN_GAP = 0.5
+
 # faster-whisper が対応する言語コード → 英語名マッピング
 WHISPER_LANGUAGES: dict[str, str] = {
     "af": "Afrikaans",

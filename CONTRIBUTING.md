@@ -246,8 +246,8 @@ device = "cuda"
 model = "large-v3"
 default_languages = ["ja", "ru"]
 
-ja_weight = 0.50
-ru_weight = 0.50
+lang1_weight = 0.50
+lang2_weight = 0.50
 
 no_speech_threshold = 0.6
 initial_prompt = ""

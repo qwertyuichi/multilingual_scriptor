@@ -159,11 +159,11 @@ available_languages = [
 
 # ---- 確率デバッグ ----
 # クリップごとの確率ログを出力 (INFO)
-debug_prob_log = false
+debug_prob_log = true
 # ファイルログ(app.log)出力
-log_file_enabled = false
+log_file_enabled = true
 # ログレベル
-log_level = "INFO"
+log_level = "DEBUG"
 # ログ出力パス
 log_file_path = "app.log"
 # ログ最大サイズ (bytes)

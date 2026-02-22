@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 try:
     import ctranslate2
@@ -21,7 +21,7 @@ except Exception:
 
 from faster_whisper.audio import decode_audio as fw_decode_audio
 
-from core.constants import DUP_MERGE_MAX_SEG_DUR, DUP_MERGE_MAX_GAP, MAX_RANGE_SEC
+from core.constants import DUP_MERGE_MAX_SEG_DUR, DUP_MERGE_MAX_GAP, MAX_RANGE_SEC, SILENCE_MIN_GAP
 from transcription.audio import (
     _extract_audio,
     _weight_lang_probs,
@@ -33,9 +33,79 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _select_device(requested: str | None) -> tuple[str, bool]:
+    """デバイス選択とフォールバック処理を共通化。
+    
+    Returns:
+        (selected_device, fallback_occurred)
+    """
+    selected = requested or ('cuda' if _CUDA_AVAILABLE else 'cpu')
+    fallback = False
+    if selected == 'cuda' and not _CUDA_AVAILABLE:
+        logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
+        selected = 'cpu'
+        fallback = True
+    return selected, fallback
+
+
 def _fmt_ts(t: float) -> str:
     """秒を HH:MM:SS.mmm 形式に変換 (ログ出力用)。"""
     return format_ms(int(t * 1000))
+
+
+def _detect_clip_language(
+    model,
+    audio_clip: Any,
+    sample_rate: int,
+    lang1: str,
+    lang2: str | None,
+    lang1_weight: float,
+    lang2_weight: float,
+    beam_size: int = 1,
+    fallback_probs: tuple[float, float, bool] | None = None,
+) -> tuple[str | None, float, float, bool]:
+    """音声クリップの言語を検出し、重み付けスコアを返す。
+    
+    Args:
+        model: faster-whisper モデル
+        audio_clip: 音声データ (numpy array)
+        sample_rate: サンプリングレート
+        lang1, lang2: 主要言語コード
+        lang1_weight, lang2_weight: スコア補正係数
+        beam_size: 言語検出 beam_size (デフォルト1で高速化)
+        fallback_probs: 検出失敗時のフォールバック確率 (lang1_prob, lang2_prob, is_confident)
+    
+    Returns:
+        (detected_lang, lang1_prob, lang2_prob, is_confident)
+    """
+    min_length = sample_rate // 5  # 200ms
+    if len(audio_clip) < min_length:
+        if fallback_probs:
+            return None, *fallback_probs
+        return None, 50.0, 50.0, False
+    
+    try:
+        _, clip_info = model.transcribe(
+            audio_clip,
+            language=None,
+            multilingual=True,
+            beam_size=beam_size,
+            vad_filter=False,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.95,
+            word_timestamps=False,
+        )
+        detected_lang = clip_info.language
+        lang1_prob, lang2_prob, is_confident = _weight_lang_probs(
+            clip_info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
+        )
+        return detected_lang, lang1_prob, lang2_prob, is_confident
+    except Exception as e:
+        logger.warning(f'[LANG_DETECT] 失敗: {e}')
+        if fallback_probs:
+            return None, *fallback_probs
+        return None, 50.0, 50.0, False
 
 
 def advanced_process_video(
@@ -88,12 +158,7 @@ def advanced_process_video(
     # Phase 1 は常に自動検出モード (lang1/lang2 混在に対応)
 
     # デバイス決定
-    selected_device = device or ('cuda' if _CUDA_AVAILABLE else 'cpu')
-    device_fallback = False
-    if selected_device == 'cuda' and not _CUDA_AVAILABLE:
-        logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
-        selected_device = 'cpu'
-        device_fallback = True
+    selected_device, device_fallback = _select_device(device)
     logger.info(f'[DEVICE] using device={selected_device}')
 
     model = _load_cached_model(model_size, selected_device)
@@ -180,9 +245,6 @@ def advanced_process_video(
         idx = 0
         total_segs = len(raw_segs)
         
-        # 無音区間の最小長さ（秒）
-        SILENCE_MIN_GAP = 0.5
-        
         # 前のセグメント終了時刻を記録（無音区間検出用）
         prev_end_time = 0.0
 
@@ -228,33 +290,17 @@ def advanced_process_video(
             clip_too_short = len(clip) < SR // 5  # 200ms 未満
 
             # クリップ個別言語検出 (beam_size=_phase2_detect_beam で高速化)
-            detected_lang = None
-            if not clip_too_short:
-                try:
-                    _, clip_info = model.transcribe(
-                        clip,
-                        language=None,
-                        beam_size=_phase2_detect_beam,
-                        temperature=0.0,
-                        vad_filter=False,
-                        condition_on_previous_text=False,
-                        no_speech_threshold=0.95,
-                    )
-                    detected_lang = clip_info.language
-                    lang1_prob, lang2_prob, is_confident = _weight_lang_probs(
-                        clip_info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
-                    )
-                    logger.debug(
-                        f'[CLIP_LANG] #{idx} t={st:.2f}-{ed:.2f} '
-                        f'{lang1}={lang1_prob:.1f}% {lang2 or "-"}={lang2_prob:.1f}% '
-                        f'confident={is_confident} '
-                        f'(clip: {clip_info.language} p={clip_info.language_probability:.2f})'
-                    )
-                except Exception as e:
-                    logger.warning(f'[CLIP_LANG] #{idx} t={st:.2f}-{ed:.2f} 失敗、グローバルで代替: {e}')
-                    lang1_prob, lang2_prob, is_confident = lang1_global, lang2_global, False
-            else:
-                lang1_prob, lang2_prob, is_confident = lang1_global, lang2_global, False
+            detected_lang, lang1_prob, lang2_prob, is_confident = _detect_clip_language(
+                model, clip, SR,
+                lang1, lang2, lang1_weight, lang2_weight,
+                beam_size=_phase2_detect_beam,
+                fallback_probs=(lang1_global, lang2_global, False),
+            )
+            logger.debug(
+                f'[CLIP_LANG] #{idx} t={st:.2f}-{ed:.2f} '
+                f'{lang1}={lang1_prob:.1f}% {lang2 or "-"}={lang2_prob:.1f}% '
+                f'confident={is_confident} detected={detected_lang}'
+            )
 
             handled_other_lang = False
             if detected_lang and detected_lang not in {lang1, lang2}:
@@ -264,7 +310,7 @@ def advanced_process_video(
                 text_lang1 = ''
                 text_lang2 = ''
                 other_text = ''
-                if not clip_too_short:
+                if len(clip) >= SR // 5:  # 200ms 以上
                     try:
                         other_gen, _ = model.transcribe(
                             clip,
@@ -527,12 +573,7 @@ def transcribe_range(
     if status_callback:
         status_callback('部分再文字起こし: モデル取得中...')
 
-    dev = device or ('cuda' if _CUDA_AVAILABLE else 'cpu')
-    device_fallback = False
-    if dev == 'cuda' and not _CUDA_AVAILABLE:
-        logger.warning('[DEVICE] cuda 選択されたが利用不可のため cpu へフォールバックします')
-        dev = 'cpu'
-        device_fallback = True
+    dev, device_fallback = _select_device(device)
     model = _load_cached_model(model_size, dev)
 
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_cut:
@@ -561,25 +602,13 @@ def transcribe_range(
 
         # Phase A: クリップ単位の言語検出
         audio_arr = fw_decode_audio(cut_path, sampling_rate=SR)
-        detected_lang = None
-        if len(audio_arr) >= SR // 5:
-            _det_gen, clip_info = model.transcribe(
-                audio_arr,
-                language=None,
-                multilingual=True,
-                beam_size=1,
-                vad_filter=False,
-                temperature=0.0,
-                word_timestamps=False,
-            )
-            for _ in _det_gen:
-                pass
-            detected_lang = clip_info.language
-            lang1_prob, lang2_prob, is_confident = _weight_lang_probs(
-                clip_info.all_language_probs, lang1, lang2, lang1_weight, lang2_weight
-            )
-        else:
-            lang1_prob, lang2_prob, is_confident = 50.0, 50.0, False
+        
+        detected_lang, lang1_prob, lang2_prob, is_confident = _detect_clip_language(
+            model, audio_arr, SR,
+            lang1, lang2, lang1_weight, lang2_weight,
+            beam_size=1,
+            fallback_probs=None,
+        )
 
         if detected_lang and detected_lang not in {lang1, lang2}:
             chosen = detected_lang

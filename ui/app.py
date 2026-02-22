@@ -618,8 +618,8 @@ class VideoTranscriptionApp(QMainWindow):
         self.lang2_weight_slider.valueChanged.connect(on_lang2_weight_changed)
 
         # 初期値を正規化 (合計1.0)
-        w1 = base_prof.get("lang1_weight", base_prof.get("ja_weight", 0.5))
-        w2 = base_prof.get("lang2_weight", base_prof.get("ru_weight", 0.5))
+        w1 = base_prof.get("lang1_weight", 0.5)
+        w2 = base_prof.get("lang2_weight", 0.5)
         total = (w1 or 0) + (w2 or 0)
         if total > 0:
             w1, w2 = w1 / total, w2 / total
@@ -687,8 +687,8 @@ class VideoTranscriptionApp(QMainWindow):
                     self.lang2_combo.setCurrentIndex(idx2)
 
             # weight の合計が 1.0 になるように正規化
-            w1 = prof.get("lang1_weight", prof.get("ja_weight", 0.5))
-            w2 = prof.get("lang2_weight", prof.get("ru_weight", 0.5))
+            w1 = prof.get("lang1_weight", 0.5)
+            w2 = prof.get("lang2_weight", 0.5)
             if isinstance(w1, (int, float)) and isinstance(w2, (int, float)):
                 total = w1 + w2
                 if total > 0:
@@ -728,7 +728,6 @@ class VideoTranscriptionApp(QMainWindow):
         exclude_keys = {
             "device", "model",
             "default_languages", "lang1_weight", "lang2_weight",
-            "ja_weight", "ru_weight",  # 旧キーも除外
               "vad_filter",
               "beam_size",  # 隠しパラメータダイアログで設定
         }
@@ -1986,45 +1985,28 @@ class VideoTranscriptionApp(QMainWindow):
         if dialog.exec() == HiddenParamsDialog.Accepted:
             new_values = dialog.get_values()
             
-            # config.toml を更新
+            # config.toml を更新 (tomlkit使用で堅牢化)
             try:
+                import tomlkit
+                
                 cfg_path = os.path.join(os.path.dirname(__file__), "..", "config.toml")
                 cfg_path = os.path.normpath(cfg_path)
                 
-                # 既存のconfig.tomlをテキストとして読み込み
+                # 既存のconfig.tomlを読み込み (コメント・書式を保持)
                 with open(cfg_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                    doc = tomlkit.load(f)
                 
-                # hiddenセクションの各パラメータを正規表現で置換 ([hidden] セクション内のみ)
-                import re
-                # [hidden] セクションの範囲を特定 (次の [section] or EOF まで)
-                hidden_match = re.search(
-                    r'(\[hidden\].*?)(?=\n\[|\Z)',
-                    content,
-                    flags=re.DOTALL | re.IGNORECASE,
-                )
-                if hidden_match:
-                    hidden_block = hidden_match.group(1)
-                    updated_block = hidden_block
-                    for key, val in new_values.items():
-                        # TOML形式の値に変換
-                        toml_val = self._toml_value(val)
-                        # [hidden] ブロック内のみ置換
-                        pattern = rf'^{re.escape(key)}\s*=\s*.*$'
-                        replacement = f'{key} = {toml_val}'
-                        updated_block = re.sub(pattern, replacement, updated_block, flags=re.MULTILINE)
-                    # 元の [hidden] ブロックを置換済みブロックに差し替え
-                    content = content[:hidden_match.start(1)] + updated_block + content[hidden_match.end(1):]
-                else:
-                    # [hidden] セクションが無ければ末尾に追加
-                    lines = ['\n[hidden]']
-                    for key, val in new_values.items():
-                        lines.append(f'{key} = {self._toml_value(val)}')
-                    content += '\n'.join(lines) + '\n'
+                # [hidden] セクションが無ければ作成
+                if "hidden" not in doc:
+                    doc["hidden"] = tomlkit.table()
                 
-                # ファイルに書き戻し
+                # 各パラメータを更新
+                for key, val in new_values.items():
+                    doc["hidden"][key] = val
+                
+                # ファイルに書き戻し (書式・コメント保持)
                 with open(cfg_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                    tomlkit.dump(doc, f)
                 
                 # メモリ上のconfigも更新
                 with open(cfg_path, "rb") as f:
